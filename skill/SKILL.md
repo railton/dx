@@ -77,22 +77,27 @@ roda no lugar errado **sem aviso**.
 
 Ao receber "veja X no banco de hml/staging/produção":
 
-1. **Descubra o alvo real, não deduza:** `dx ssh <host> "docker ps --format '{{.Names}}'"`.
-2. **Aponte explicitamente**, sobrescrevendo por comando (o export vence o `.env` e não
-   altera a config local):
+1. **Descubra o alvo real, não deduza:** `dx ssh <host> "docker ps --format '{{.Names}}'"`
+   e, se preciso, os bancos:
+   `DX_PG_DB=postgres dx pg --host <host> "SELECT datname FROM pg_database WHERE NOT datistemplate"`.
+2. **Identifique a topologia** — normalmente é **um Postgres compartilhado com um banco
+   por ambiente** (`postgres` → `app_hml`, `app_dev`, ...). Nesse caso o container é o
+   mesmo do local e **só o banco muda**; se o `DX_PG_DB` for derivado
+   (`DX_PG_DB=${POSTGRES_DB}`), basta a variável do projeto:
    ```bash
-   DX_PG_CONTAINER=<container> DX_PG_DB=<banco> dx pg --host <host> "SELECT ..."
+   APP_ENV=hml dx pg --host <host> "SELECT ..."
    ```
-   Se o banco for derivado (`DX_PG_DB=${POSTGRES_DB}`), basta a variável de ambiente do
-   projeto (ex.: `APP_ENV=hml`) que o nome acompanha.
-3. **Confirme antes de rodar:** mostre ao usuário host + container + banco resolvidos
-   (`dx config` com as mesmas variáveis na frente) e só então execute. Ambiente
-   compartilhado não é lugar de tentativa e erro.
-4. **Escrita (`UPDATE`/`DELETE`/DDL) exige autorização explícita** para o ambiente em
+   Só sobrescreva `DX_PG_CONTAINER` se de fato houver um Postgres por ambiente.
+3. **Confirme antes de rodar:** mostre ao usuário host + container + banco e só então
+   execute. Ambiente compartilhado não é lugar de tentativa e erro.
+4. **Confira o banner** que o `dx` imprime em toda query remota
+   (`→ remoto: <host> · <container> · <banco>`) e **reproduza-o na sua resposta** ao
+   relatar dados de outro ambiente — é o que prova de onde veio o número.
+5. **Escrita (`UPDATE`/`DELETE`/DDL) exige autorização explícita** para o ambiente em
    questão — o auto-`LIMIT` só protege `SELECT`. Autorização para um ambiente não vale
    para outro.
-5. Se o resultado vier vazio ou estranho, **suspeite do alvo antes da query**: container
-   de outro ambiente responde normalmente, só com os dados errados.
+6. Se o resultado vier vazio ou estranho, **suspeite do alvo antes da query**: banco de
+   outro ambiente responde normalmente, só com os dados errados.
 
 ## Azure DevOps work item (`dx wi`)
 

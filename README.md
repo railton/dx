@@ -191,21 +191,49 @@ psql interativo remoto via `ssh -t`.
 > O `dx` não inspeciona o host remoto e não tem como saber que o nome certo lá é outro.
 
 Isso importa quando **um mesmo servidor hospeda vários ambientes** (dev, hml, staging).
-Em geral o erro é barulhento — o container não existe naquele host, ou o banco não existe.
-Mas se o host tiver um container com o **mesmo nome** pertencendo a outro ambiente, a query
-roda no lugar errado sem aviso. Então descubra os nomes antes e aponte explicitamente:
+Comece descobrindo o que existe lá, em vez de deduzir:
 
 ```bash
-dx ssh user@srv "docker ps --format '{{.Names}}'"          # 1. o que existe lá
+dx ssh user@srv "docker ps --format '{{.Names}}'"
+```
 
-DX_PG_CONTAINER=pg-hml DX_PG_DB=meuapp_hml \
-  dx pg --host user@srv "SELECT ..."                       # 2. aponta explícito
+Duas topologias comuns, com implicações bem diferentes:
+
+**1. Um Postgres compartilhado, ambientes separados por banco** (o arranjo mais comum):
+
+```
+app-hml  app-dev  app-sistema
+postgres → meuapp_hml · meuapp_dev · meuapp_sistema
+```
+
+O nome do container é o mesmo do seu local, então **só o banco muda**. Se o `DX_PG_DB`
+for derivado (`DX_PG_DB=${POSTGRES_DB}` com `POSTGRES_DB=meuapp_${APP_ENV}`), uma
+variável resolve tudo:
+
+```bash
+APP_ENV=hml dx pg --host user@srv "SELECT ..."
+```
+
+**2. Um Postgres por ambiente** (containers com nomes distintos) — aí aponte os dois:
+
+```bash
+DX_PG_CONTAINER=pg-hml DX_PG_DB=meuapp_hml dx pg --host user@srv "SELECT ..."
 ```
 
 Variável exportada vence o `.env` e vale só para aquele comando — a config local fica
-intacta. Se o nome do banco for derivado (`DX_PG_DB=${POSTGRES_DB}` com
-`POSTGRES_DB=meuapp_${APP_ENV}`), basta `APP_ENV=hml` que ele acompanha sozinho.
-Confira com `dx config` (mesmas variáveis na frente) antes de rodar a query.
+intacta.
+
+**Como cada erro se manifesta:** se o container não existir no host, o Docker responde
+`No such container` — falha barulhenta, sem risco. Se o container existir mas o banco
+não, o psql recusa a conexão — também barulhento. O caso silencioso é o **banco errado
+que existe**: trocar `hml` por `dev` conecta normalmente e devolve dados do ambiente
+errado. Por isso o `dx` anuncia o alvo antes de toda query remota:
+
+```
+→ remoto: user@srv · postgres · meuapp_hml
+```
+
+Confira essa linha — é a única defesa contra o ambiente trocado.
 
 **`dx yii` e `dx logs` não têm modo remoto** — atuam sempre no container/repo local. Para
 console ou log de outro servidor, use `dx ssh`.

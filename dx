@@ -367,6 +367,11 @@ cmd_pg() {
   # Precheck do container só no modo local (no remoto, o erro do docker/ssh aparece na query).
   [[ -z "$PG_SSH" ]] && precheck_pg_container
 
+  # No remoto, anuncia o alvo antes de rodar. O dx não inspeciona o host: se lá houver
+  # container homônimo de OUTRO ambiente, a query roda no lugar errado sem erro nenhum.
+  # Esta linha é o que torna esse caso visível — não remova.
+  [[ -n "$PG_SSH" ]] && info "remoto: ${PG_SSH} · ${PG_CONTAINER} · ${PG_DB}"
+
   # Sem args → shell interativo (sem filtros); remoto abre via ssh -t.
   if [[ $# -eq 0 ]]; then
     if [[ -n "$PG_SSH" ]]; then
