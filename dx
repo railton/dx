@@ -1,0 +1,859 @@
+#!/usr/bin/env bash
+# dx — dev-exec wrapper para reduzir output tokenizado de PostgreSQL/Docker e SSH
+#
+# Uso:
+#   dx pg  "<query>"                  Roda query via docker exec + psql, output reduzido
+#   dx pg  --describe <tabela>        \d tabela
+#   dx pg  --list-tables              \dt
+#   dx pg  --explain "<query>"        EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) só nó top
+#   dx pg                             Shell psql interativo (sem filtros)
+#   dx pg  --host <user@srv> "<q>"    Roda o psql via ssh→docker exec no host remoto
+#                                     (ou defina DX_PG_SSH no .env). Mantém TSV/auto-LIMIT;
+#                                     NÃO aplica o strip do ssh (não corrompe datas).
+#   dx pg  --find <termo>             Busca tabela/coluna no schema (evita nome errado)
+#   dx ssh <host> "<comando>"         Roda comando via SSH com output reduzido
+#   dx yii <comando> [args]           Console Yii dentro do container do app
+#                                     (ex: dx yii migrate). Use --interactive=0 p/ sem prompt.
+#   dx config                         Mostra a config resolvida p/ este projeto e o que falta
+#   dx logs [-n N] [--errors]         Log do app colapsando frames de dependências
+#                                     (preserva os frames do projeto). --file <path> p/ outro log.
+#   dx wi  <id>                       Work item do Azure DevOps (campos + repro + comentários);
+#                                     baixa anexos/prints (inline e AttachedFile) automaticamente
+#   dx wi  <id> --relacoes            + lista relações (pai/filho/relacionados)
+#   dx wi  <id> --no-anexos           não baixa anexos (só texto, p/ pipe/grep)
+#   dx wi  <id> --dir <D>             baixa anexos em D (default: $TMPDIR/dx-wi-<id>)
+#   dx wi  <id> --json                JSON cru da API (pra pipar em jq)
+#
+# Flags globais:
+#   --raw                 Desliga o pipeline de redução (output cru / texto integral)
+#   --full                Não injeta LIMIT 100 em queries pg sem LIMIT
+#   --save <arquivo>      Salva output completo em arquivo, devolve só sumário
+#   --max-lines N         Override do limite de linhas (default: 80)
+#   -h | --help           Mostra este help
+#
+# Config por projeto:
+#   O dx é global (instalado em ~/.local/bin), mas resolve config a partir do
+#   PROJETO ATUAL (o diretório onde você o executa / raiz do repo git), não de
+#   onde o script mora.
+#
+#   Precedência: env exportado > .env (linhas DX_*) > defaults.
+#
+#   Única forma de config por projeto — bloco no fim do .env do projeto (não cria
+#   arquivo novo e o .env já costuma estar no .gitignore):
+#     DX_PG_CONTAINER=meu-postgres
+#     DX_PG_DB=meu_db
+#     DX_AZDO_ORG=minha-org
+#     DX_AZDO_PROJECT=MeuProjeto
+#
+#   O .env é PARSEADO (não é feito `source`): ele continua válido para docker
+#   compose / dotenv e nenhum código do arquivo é executado. Para valores
+#   dinâmicos, exporte a variável no shell (.envrc/direnv, wrapper do projeto):
+#   ela tem precedência sobre o .env.
+#
+# Env:
+#   DX_PG_CONTAINER  (default: postgres)
+#   DX_PG_USER       (default: postgres)
+#   DX_PG_DB         (OBRIGATÓRIO — defina no .env do projeto; sem default)
+#   DX_PG_SSH        (default: vazio) host ssh p/ rodar o psql remoto (= flag --host)
+#   DX_APP_CONTAINER (default: app-local)  container do app (yii/logs)
+#   DX_APP_DIR       (default: /var/www/html)  workdir do app no container
+#   DX_YII_BIN       (default: yii)  binário do console Yii, relativo a DX_APP_DIR
+#   DX_LOG_PATH      (default: app/runtime/logs/app.log)  log do app, relativo à raiz do projeto
+#   DX_VENDOR_MARK   (default: /vendor/)  marca de frame de dependência a colapsar
+#   DX_MAX_LINES     (default: 80)
+#   DX_AZDO_ORG      (auto: do remote git se for dev.azure.com)  org do Azure DevOps
+#   DX_AZDO_PROJECT  (auto: do remote git se for dev.azure.com)  projeto/team project
+#   DX_ENV_FILE      (default: .env na raiz do repo atual) de onde ler config/PAT
+
+set -euo pipefail
+
+# ────────────────────────────────────────────────────────────────
+# Config por projeto — carregada ANTES dos defaults, a partir do diretório
+# atual / raiz do repo git. Precedência:
+#   env exportado no shell  ›  .env (linhas DX_*)  ›  defaults
+#
+# Fonte única: um bloco de linhas `DX_PG_DB=meu_db` no .env do projeto (formato
+# dotenv; não cria arquivo novo e já costuma estar no .gitignore). O dx NUNCA
+# faz `source` de arquivo de projeto.
+#
+# Valores DX_* aceitam referência a outras chaves do .env: `DX_PG_DB=${POSTGRES_DB}`
+# ou `DX_APP_CONTAINER=app-${APP_ENV}` — assim o nome do banco/container mora num
+# lugar só. A expansão é TEXTUAL e recursiva (o alvo pode referenciar outro),
+# feita à mão: sem `eval`, sem `source`, e `$(...)`/backtick ficam literais.
+# ────────────────────────────────────────────────────────────────
+_dx_project_root() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
+
+declare -A _DX_ENV_TABLE=()
+
+# Cadeia de nomes sendo expandidos agora, para detectar ciclo. Cada _dx_ref roda
+# em subshell ($(...)), então a cadeia só desce — o pai nunca vê a do filho, que
+# é exatamente a semântica desejada.
+_DX_EXPANDING=""
+
+# Resolve o nome referenciado: env exportado no shell vence o .env.
+_dx_ref() {
+  local name="$1" depth="$2"
+  if [[ -n "${!name:-}" ]]; then printf '%s' "${!name}"; return 0; fi
+  # Ciclo (A=${B}, B=${A}): corta em vazio em vez de reentrar.
+  case " $_DX_EXPANDING " in *" $name "*) return 0 ;; esac
+  _DX_EXPANDING="$_DX_EXPANDING $name"
+  _dx_expand "${_DX_ENV_TABLE[$name]:-}" "$depth"
+}
+
+# Expande ${VAR} e $VAR dentro de um valor. Só o padrão de NOME é reconhecido:
+# `$(cmd)` e crase não casam com a regex e sobrevivem como texto.
+_dx_expand() {
+  local val="$1" depth="${2:-0}" name rep iter=0
+  # Ciclo é barrado por _DX_EXPANDING; profundidade e iterações são só limites de
+  # sanidade, para nenhum .env estranho custar caro (cada ${} é um subshell).
+  (( depth > 8 )) && { printf '%s' "$val"; return 0; }
+  while (( ++iter <= 16 )); do
+    if [[ "$val" =~ \$\{([A-Za-z_][A-Za-z0-9_]*)\} ]]; then
+      name="${BASH_REMATCH[1]}"
+      rep="$(_dx_ref "$name" $((depth + 1)))"
+      val="${val//\$\{$name\}/$rep}"
+    elif [[ "$val" =~ \$([A-Za-z_][A-Za-z0-9_]*) ]]; then
+      name="${BASH_REMATCH[1]}"
+      rep="$(_dx_ref "$name" $((depth + 1)))"
+      val="${val//\$$name/$rep}"
+    else
+      break
+    fi
+  done
+  printf '%s' "$val"
+}
+
+# Lê o .env do projeto. Faz PARSE (grep), nunca `source`: o .env é consumido por
+# docker compose / dotenv e deve permanecer KEY=value puro — além de evitar
+# executar código arbitrário vindo do arquivo.
+#
+# Todas as chaves entram na tabela (são o alvo possível de um ${...}), mas SÓ as
+# DX_* viram variável do script: o dx não passa a enxergar config alheia, e um
+# segredo de outra ferramenta só é tocado se você escrever o ${...} você mesmo.
+_dx_load_env_vars() {
+  local envf="${DX_ENV_FILE:-$(_dx_project_root)/.env}"
+  [[ -f "$envf" ]] || return 0
+  local line key val
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    val="${line#*=}"
+    val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+    val="${val//$'\r'/}"
+    _DX_ENV_TABLE["$key"]="$val"
+  done < <(grep -E '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' "$envf" 2>/dev/null | sed 's/^[[:space:]]*//')
+
+  for key in "${!_DX_ENV_TABLE[@]}"; do
+    [[ "$key" == DX_* ]] || continue
+    # Não sobrescreve o que já veio exportado do shell.
+    [[ -n "${!key:-}" ]] || printf -v "$key" '%s' "$(_dx_expand "${_DX_ENV_TABLE[$key]}")"
+  done
+  return 0
+}
+_dx_load_env_vars
+
+# ────────────────────────────────────────────────────────────────
+# Config / defaults
+# ────────────────────────────────────────────────────────────────
+PG_CONTAINER="${DX_PG_CONTAINER:-postgres}"
+PG_USER="${DX_PG_USER:-postgres}"
+PG_DB="${DX_PG_DB:-}"    # sem default: apontar pro banco errado silenciosamente é pior que falhar
+PG_SSH="${DX_PG_SSH:-}"   # se setado, roda o psql via ssh→docker exec no host remoto
+APP_CONTAINER="${DX_APP_CONTAINER:-app-local}"          # container do app (subcomandos yii/logs)
+APP_DIR="${DX_APP_DIR:-/var/www/html}"                  # workdir do app dentro do container
+YII_BIN="${DX_YII_BIN:-yii}"                            # binário do console Yii (relativo a APP_DIR)
+LOG_PATH="${DX_LOG_PATH:-app/runtime/logs/app.log}"     # log do app (relativo à raiz do projeto)
+VENDOR_MARK="${DX_VENDOR_MARK:-/vendor/}"               # marca de frame de dependência (colapsado)
+MAX_LINES="${DX_MAX_LINES:-80}"
+LONG_LINE=180        # trunca conteúdo de célula/linha acima desse
+HEAD_TAIL=20         # quando truncar, mantém head + tail
+RAW=0
+FULL=0
+SAVE_FILE=""
+
+# ────────────────────────────────────────────────────────────────
+# Cores (desliga se stderr não é TTY ou NO_COLOR setado)
+# ────────────────────────────────────────────────────────────────
+if [[ -t 2 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+  C_RED=$'\033[1;31m'
+  C_YEL=$'\033[1;33m'
+  C_DIM=$'\033[2m'
+  C_OFF=$'\033[0m'
+else
+  C_RED="" C_YEL="" C_DIM="" C_OFF=""
+fi
+
+# ────────────────────────────────────────────────────────────────
+# Helpers de log (sempre em stderr para não poluir o output filtrado)
+# ────────────────────────────────────────────────────────────────
+error() { echo "${C_RED}✗ dx: $*${C_OFF}" >&2; }
+warn()  { echo "${C_YEL}⚠ dx: $*${C_OFF}" >&2; }
+info()  { echo "${C_DIM}→ $*${C_OFF}" >&2; }
+die()   { error "$*"; exit 1; }
+
+# Reporta erro com bloco visível e prefixo nas linhas
+report_block() {
+  local title="$1"; shift
+  echo "${C_RED}┌─ ${title}${C_OFF}" >&2
+  while IFS= read -r line; do
+    echo "${C_RED}│${C_OFF} $line" >&2
+  done
+  echo "${C_RED}└─────${C_OFF}" >&2
+}
+
+# Trap para erros não tratados
+trap 'rc=$?; [[ $rc -ne 0 ]] && error "abortou inesperadamente (linha $LINENO, exit $rc)"' ERR
+
+print_help() { sed -n '2,/^set -/p' "$0" | sed 's/^# \{0,1\}//;s/^set -.*//' | head -n -1; }
+
+# Trunca linhas individuais acima de LONG_LINE chars
+trim_long_lines() {
+  awk -v n="$LONG_LINE" '
+    {
+      if (length($0) > n) {
+        printf("%s ... [+%d chars]\n", substr($0,1,n), length($0)-n)
+      } else {
+        print
+      }
+    }
+  '
+}
+
+# Dedup consecutivo com contador: [×N] linha
+dedup_consecutive() {
+  awk '
+    {
+      if ($0 == prev) { count++ }
+      else {
+        if (NR > 1) {
+          if (count > 1) printf("[\xc3\x97%d] %s\n", count, prev)
+          else print prev
+        }
+        prev = $0; count = 1
+      }
+    }
+    END {
+      if (NR > 0) {
+        if (count > 1) printf("[\xc3\x97%d] %s\n", count, prev)
+        else print prev
+      }
+    }
+  '
+}
+
+# Mantém HEAD + tail se > MAX_LINES
+head_tail_sample() {
+  local max="$MAX_LINES" head="$HEAD_TAIL" tail="$HEAD_TAIL"
+  awk -v max="$max" -v h="$head" -v t="$tail" '
+    { lines[NR] = $0 }
+    END {
+      if (NR <= max) { for (i=1;i<=NR;i++) print lines[i]; exit }
+      for (i=1;i<=h;i++) print lines[i]
+      printf("... [%d linhas omitidas] ...\n", NR - h - t)
+      for (i=NR-t+1;i<=NR;i++) print lines[i]
+    }
+  '
+}
+
+# Pipeline padrão de redução
+reduce() {
+  if [[ $RAW -eq 1 ]]; then cat; return; fi
+  trim_long_lines | dedup_consecutive | head_tail_sample
+}
+
+# Salva completo em arquivo, devolve sumário
+maybe_save() {
+  if [[ -z "$SAVE_FILE" ]]; then
+    reduce
+    return
+  fi
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp"
+  mv "$tmp" "$SAVE_FILE"
+  local total; total=$(wc -l < "$SAVE_FILE")
+  echo "→ Output completo salvo em: $SAVE_FILE ($total linhas)"
+  echo "--- prévia (head 10 / tail 10) ---"
+  head -10 "$SAVE_FILE"
+  if [[ $total -gt 20 ]]; then
+    echo "..."
+    tail -10 "$SAVE_FILE"
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────
+# Subcomando: pg
+# ────────────────────────────────────────────────────────────────
+inject_limit_if_missing() {
+  local q="$1"
+  if [[ $FULL -eq 1 ]]; then echo "$q"; return; fi
+  # só mexe em SELECT sem LIMIT
+  if [[ "$q" =~ ^[[:space:]]*[Ss][Ee][Ll][Ee][Cc][Tt] ]] && ! [[ "$q" =~ [Ll][Ii][Mm][Ii][Tt][[:space:]]+[0-9]+ ]]; then
+    # remove ; final se houver
+    q="${q%;}"
+    echo "${q} LIMIT 100"
+    info "auto-LIMIT 100 aplicado (use --full pra desligar)"
+  else
+    echo "$q"
+  fi
+}
+
+precheck_pg_container() {
+  if ! docker info >/dev/null 2>&1; then
+    die "Docker não está acessível. Verifique se o daemon está rodando."
+  fi
+  if ! docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER"; then
+    error "container '$PG_CONTAINER' não está rodando."
+    info  "containers ativos:"
+    docker ps --format '  - {{.Names}}' >&2 || true
+    info  "ajuste com DX_PG_CONTAINER=<nome> ou suba o container com 'make services-up'"
+    exit 1
+  fi
+}
+
+# Single-quote cada argumento de forma sh-safe (protege tab, <>, espaços) para
+# montar um comando remoto que sobrevive à re-interpretação pelo shell do ssh.
+shq() {
+  local out='' a
+  for a in "$@"; do out+=" '${a//\'/\'\\\'\'}'"; done
+  printf '%s' "${out# }"
+}
+
+# Executa psql capturando stderr e reportando erros visivelmente.
+# Local: docker exec ... psql -c. Remoto (PG_SSH setado): ssh → docker exec -i psql -f -
+# (query vai por STDIN, evitando aspas), mantendo o mesmo pipeline de redução — SEM o
+# strip_ssh_noise, que corromperia linhas de dados iniciadas por data.
+#   $1 = query
+#   $2 = modo TSV (1 = -A -F\t -P null, default; 0 = tuples-only cru, p/ EXPLAIN JSON etc.)
+run_psql_c() {
+  local q="$1" tsv="${2:-1}"
+  local -a fmt=()
+  if [[ "$tsv" == "1" ]]; then
+    fmt=(-A -F$'\t' -P null='<NULL>')   # TSV: unaligned + separador tab + header
+  else
+    fmt=(-t -A)                         # cru: tuples-only unaligned (valor puro, ex. JSON do EXPLAIN)
+  fi
+  local stderr_file rc=0
+  stderr_file="$(mktemp)"
+  if [[ -n "$PG_SSH" ]]; then
+    local rcmd
+    rcmd="$(shq docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" "${fmt[@]}" -v ON_ERROR_STOP=1 -f -)"
+    printf '%s' "$q" | ssh -o LogLevel=ERROR "$PG_SSH" "$rcmd" 2>"$stderr_file" || rc=$?
+  else
+    docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" \
+      "${fmt[@]}" -v ON_ERROR_STOP=1 -c "$q" 2>"$stderr_file" || rc=$?
+  fi
+  if [[ $rc -ne 0 ]]; then
+    error "psql falhou (exit $rc)${PG_SSH:+ [remoto: $PG_SSH]}"
+    info  "query: $q"
+    report_block "stderr do psql" < "$stderr_file"
+    rm -f "$stderr_file"
+    exit "$rc"
+  fi
+  # Mesmo com sucesso, mostra avisos do psql se houver (NOTICE/WARNING)
+  if [[ -s "$stderr_file" ]]; then
+    report_block "avisos do psql" < "$stderr_file"
+  fi
+  rm -f "$stderr_file"
+}
+
+cmd_pg() {
+  # Sem banco definido, abortar: um default global apontaria queries de OUTRO projeto
+  # para o banco errado sem aviso.
+  if [[ -z "$PG_DB" ]]; then
+    error "banco não definido para este projeto."
+    info  "adicione ao .env na raiz do repo:  DX_PG_DB=meu_banco"
+    info  "(veja a seção 'Configuração por projeto' no README do dx) ou exporte DX_PG_DB"
+    exit 1
+  fi
+  # Precheck do container só no modo local (no remoto, o erro do docker/ssh aparece na query).
+  [[ -z "$PG_SSH" ]] && precheck_pg_container
+
+  # Sem args → shell interativo (sem filtros); remoto abre via ssh -t.
+  if [[ $# -eq 0 ]]; then
+    if [[ -n "$PG_SSH" ]]; then
+      exec ssh -t "$PG_SSH" docker exec -it "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB"
+    fi
+    exec docker exec -it "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB"
+  fi
+
+  case "$1" in
+    --list-tables)
+      run_psql_c "\dt" | maybe_save
+      ;;
+    --describe)
+      shift; [[ $# -eq 0 ]] && die "uso: dx pg --describe <tabela>"
+      run_psql_c "\d $1" | maybe_save
+      ;;
+    --find)
+      shift; [[ $# -eq 0 ]] && die "uso: dx pg --find <termo>   (busca tabela/coluna no schema)"
+      local term="$1"
+      term="${term//\'/\'\'}"                    # escapa aspa simples (SQL-safe)
+      [[ "$term" == *%* ]] || term="%${term}%"   # sem curinga explícito → busca parcial
+      run_psql_c "SELECT table_name, column_name, data_type
+                  FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND (column_name ILIKE '$term' OR table_name ILIKE '$term')
+                  ORDER BY table_name, column_name" | maybe_save
+      ;;
+    --explain)
+      shift; [[ $# -eq 0 ]] && die "uso: dx pg --explain \"<query>\""
+      local explain_q="EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) $1"
+      local json_out jq_rc=0
+      json_out="$(run_psql_c "$explain_q" 0)"
+      # tenta extrair o nó top via jq; se falhar, devolve o JSON cru e avisa
+      local parsed
+      parsed="$(printf '%s' "$json_out" | jq -r '
+        if type == "array" then .[0]
+        else .
+        end
+        | "Plano:        \(.Plan."Node Type")
+Custo total:  \(.Plan."Total Cost")
+Tempo (ms):   \(.["Execution Time"])
+Planning ms:  \(.["Planning Time"])
+Linhas:       \(.Plan."Plan Rows")
+Filtro:       \(.Plan.Filter // "—")
+Index:        \(.Plan."Index Name" // "—")"
+      ' 2>&1)" || jq_rc=$?
+      if [[ $jq_rc -ne 0 ]]; then
+        warn "jq não conseguiu parsear o EXPLAIN — caindo para output cru"
+        report_block "erro de parse" <<< "$parsed"
+        printf '%s\n' "$json_out" | maybe_save
+      else
+        printf '%s\n' "$parsed" | maybe_save
+      fi
+      ;;
+    -*)
+      die "flag desconhecida: $1 (use --list-tables, --describe, --explain ou \"<query>\")"
+      ;;
+    *)
+      local raw_query="$*"
+      local query; query="$(inject_limit_if_missing "$raw_query")"
+      run_psql_c "$query" | maybe_save
+      ;;
+  esac
+}
+
+# ────────────────────────────────────────────────────────────────
+# Subcomando: ssh
+# ────────────────────────────────────────────────────────────────
+strip_ssh_noise() {
+  # Remove timestamps de syslog e ISO + PID em colchetes
+  # Regex simples para máxima compatibilidade entre gawk/mawk/busybox awk
+  awk '
+    {
+      # journalctl: "May 20 08:15:23 hostname svc[123]: msg"
+      sub(/^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [^ ]+ /, "")
+      # ISO 8601 prefix: "2026-05-20T08:15:23" + opcional frac/tz até primeiro espaço
+      sub(/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9][^ ]* /, "")
+      # PID em colchetes (ex: "[1234]:" ou "[1234]")
+      sub(/\[[0-9]+\]:?/, "")
+      print
+    }
+  '
+}
+
+cmd_ssh() {
+  [[ $# -lt 2 ]] && die "uso: dx ssh <host> \"<comando>\""
+  local host="$1"; shift
+  local remote_cmd="$*"
+  local stderr_file rc=0
+  stderr_file="$(mktemp)"
+  # --raw entrega a saída remota realmente crua (sem strip de timestamp/PID).
+  local -a strip=(strip_ssh_noise)
+  [[ $RAW -eq 1 ]] && strip=(cat)
+  ssh -o LogLevel=ERROR -o BatchMode=no "$host" "$remote_cmd" 2>"$stderr_file" \
+    | "${strip[@]}" | maybe_save || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    error "ssh falhou (exit $rc) ao executar em '$host'"
+    info  "comando remoto: $remote_cmd"
+    if [[ -s "$stderr_file" ]]; then
+      report_block "stderr do ssh" < "$stderr_file"
+    else
+      info "stderr vazio — verifique conectividade, chave SSH ou se o comando remoto existe"
+    fi
+    rm -f "$stderr_file"
+    exit "$rc"
+  fi
+  # comando remoto retornou ok mas pode ter avisos no stderr
+  if [[ -s "$stderr_file" ]]; then
+    report_block "stderr do comando remoto" < "$stderr_file"
+  fi
+  rm -f "$stderr_file"
+}
+
+# ────────────────────────────────────────────────────────────────
+# Subcomando: wi (Azure DevOps work item)
+# ────────────────────────────────────────────────────────────────
+# Sem defaults fixos: org/projeto errados puxariam o work item de outro time.
+# Mas org/projeto estão no remote do próprio repo — derivar de lá não é chute, é
+# ler o dado do projeto atual. Só entra quando o .env não define (o .env vence,
+# para repo espelhado ou remote atípico).
+#
+#   SSH:   git@ssh.dev.azure.com:v3/<org>/<projeto>/<repo>
+#   HTTPS: https://<org>@dev.azure.com/<org>/<projeto>/_git/<repo>
+_dx_azdo_from_remote() {
+  local url; url="$(git remote get-url origin 2>/dev/null)" || return 0
+  case "$url" in
+    *dev.azure.com*) ;;
+    *) return 0 ;;                       # outro host (GitHub etc.): não inventa
+  esac
+  local rest
+  if [[ "$url" == *:v3/* ]]; then
+    rest="${url#*:v3/}"                  # <org>/<projeto>/<repo>
+  else
+    rest="${url#*dev.azure.com/}"        # <org>/<projeto>/_git/<repo>
+  fi
+  [[ "$rest" == */* ]] || return 0
+  local org="${rest%%/*}" tail="${rest#*/}"
+  local proj="${tail%%/*}"
+  [[ -z "$org" || -z "$proj" ]] && return 0
+  printf '%s\n%s\n' "$org" "$proj"
+}
+
+WI_ORG="${DX_AZDO_ORG:-}"
+WI_PROJECT="${DX_AZDO_PROJECT:-}"
+if [[ -z "$WI_ORG" || -z "$WI_PROJECT" ]]; then
+  _dx_r_org=""; _dx_r_proj=""
+  { read -r _dx_r_org || true; read -r _dx_r_proj || true; } < <(_dx_azdo_from_remote)
+  WI_ORG="${WI_ORG:-$_dx_r_org}"
+  WI_PROJECT="${WI_PROJECT:-$_dx_r_proj}"
+fi
+# Nome fixo, sem indireção: o dx só lê variáveis do próprio namespace DX_.
+# Se o PAT já existir sob outro nome, exporte a ponte no shell: DX_AZDO_PAT="$OUTRO".
+WI_PAT_VAR="DX_AZDO_PAT"
+
+# Localiza o .env do PROJETO ATUAL (não da pasta do script — o dx é global):
+# DX_ENV_FILE explícito → raiz do repo git (do CWD) → .env no CWD.
+find_env_file() {
+  if [[ -n "${DX_ENV_FILE:-}" ]]; then echo "$DX_ENV_FILE"; return; fi
+  local root
+  root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$root" && -f "$root/.env" ]]; then echo "$root/.env"; return; fi
+  [[ -f "$PWD/.env" ]] && echo "$PWD/.env"
+}
+
+# Lê o PAT do .env sem jamais ecoá-lo. Retorna o valor em stdout.
+load_azdo_pat() {
+  local envf; envf="$(find_env_file)"
+  [[ -z "$envf" || ! -f "$envf" ]] && die "não achei .env (defina DX_ENV_FILE ou rode dentro do repo)"
+  local line; line="$(grep -E "^${WI_PAT_VAR}=" "$envf" | tail -1 || true)"
+  [[ -z "$line" ]] && die "variável ${WI_PAT_VAR} não encontrada em $envf"
+  local val="${line#*=}"
+  val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"; val="${val//$'\r'/}"
+  [[ -z "$val" ]] && die "${WI_PAT_VAR} está vazia em $envf"
+  printf '%s' "$val"
+}
+
+# GET na REST API do Azure DevOps. $1=path (após a org, começando com /), $2=pat, $3=soft?
+# Sem soft: erro != 200 → bloco vermelho + exit. Com "soft": retorna 1 silenciosamente.
+azdo_api() {
+  local path="$1" pat="$2" soft="${3:-}"
+  local url="https://dev.azure.com/${WI_ORG}${path}"
+  local body_file code rc=0
+  body_file="$(mktemp)"
+  code="$(curl -sS -u ":${pat}" "$url" -o "$body_file" -w '%{http_code}')" || rc=$?
+  if [[ $rc -ne 0 || "$code" != "200" ]]; then
+    rm -f "$body_file"
+    [[ "$soft" == "soft" ]] && return 1
+    error "Azure DevOps retornou HTTP ${code:-?} (curl exit $rc)"
+    info  "url: $url"
+    [[ "$code" == "203" || "$code" == "302" || "$code" == "401" ]] && \
+      info "dica: PAT inválido/expirado ou sem escopo Work Items (Read)"
+    exit 1
+  fi
+  cat "$body_file"; rm -f "$body_file"
+}
+
+# HTML → texto legível. Usa python3 (decodifica entidades) ou cai p/ sed best-effort.
+html_to_text() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys,re,html
+t=sys.stdin.read()
+t=re.sub(r"(?i)<br\s*/?>","\n",t)
+t=re.sub(r"(?i)</(p|div|li|tr|h[1-6])>","\n",t)
+t=re.sub(r"<[^>]+>"," ",t)
+t=html.unescape(t)
+t=re.sub(r"[ \t]+\n","\n",t)
+t=re.sub(r"\n{3,}","\n\n",t)
+print(t.strip())'
+  else
+    sed -e 's/<br[^>]*>/\n/gI' -e 's/<[^>]*>/ /g' \
+        -e 's/&nbsp;/ /g' -e 's/&amp;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&quot;/"/g' \
+        -e 's/  */ /g'
+  fi
+}
+
+cmd_wi() {
+  [[ $# -eq 0 ]] && die "uso: dx wi <id> [--relacoes] [--no-anexos] [--dir <dir>] [--json]"
+  local id="$1"; shift
+  [[ "$id" =~ ^[0-9]+$ ]] || die "id inválido: '$id' (esperado número)"
+
+  local want_relacoes=0 want_json=0 no_anexos=0 out_dir=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --relacoes)  want_relacoes=1; shift ;;
+      --no-anexos) no_anexos=1; shift ;;
+      --json)      want_json=1; shift ;;
+      --dir)       out_dir="${2:-}"; [[ -z "$out_dir" ]] && die "--dir requer um caminho"; shift 2 ;;
+      *)           die "flag desconhecida em wi: $1" ;;
+    esac
+  done
+  # Anexos baixam por padrão p/ um dir temporário previsível (sem sujar o CWD).
+  [[ -z "$out_dir" ]] && out_dir="${TMPDIR:-/tmp}/dx-wi-${id}"
+
+  if [[ -z "$WI_ORG" || -z "$WI_PROJECT" ]]; then
+    error "org/projeto do Azure DevOps não definidos para este projeto."
+    info  "normalmente vêm do remote git (dev.azure.com); se o remote não for do Azure,"
+    info  "adicione ao .env na raiz do repo:  DX_AZDO_ORG=... e DX_AZDO_PROJECT=..."
+    exit 1
+  fi
+
+  local pat; pat="$(load_azdo_pat)"
+  local json
+  json="$(azdo_api "/${WI_PROJECT}/_apis/wit/workItems/${id}?\$expand=all&api-version=7.1" "$pat")"
+
+  if [[ $want_json -eq 1 ]]; then
+    RAW=1; printf '%s\n' "$json" | maybe_save   # JSON cru: não passa pela redução
+    return
+  fi
+
+  {
+    jq -r '
+      .fields as $f
+      | "ID       : \(.id)",
+        "Tipo     : \($f["System.WorkItemType"] // "-")",
+        "Titulo   : \($f["System.Title"] // "-")",
+        "Estado   : \($f["System.State"] // "-") / \($f["System.Reason"] // "-")",
+        "Area     : \($f["System.AreaPath"] // "-")",
+        "Sprint   : \($f["System.IterationPath"] // "-")",
+        "Assigned : \(($f["System.AssignedTo"].displayName) // "-")",
+        "Criado   : \($f["System.CreatedDate"] // "-")",
+        "Tags     : \($f["System.Tags"] // "-")"
+    ' <<<"$json"
+
+    echo
+    echo "--- Repro Steps / Descrição ---"
+    local repro
+    repro="$(jq -r '.fields["Microsoft.VSTS.TCM.ReproSteps"] // .fields["System.Description"] // ""' <<<"$json" | html_to_text)"
+    [[ -n "$repro" ]] && echo "$repro" || echo "(vazio)"
+
+    local ccount cjson=""
+    ccount="$(jq -r '.fields["System.CommentCount"] // 0' <<<"$json")"
+    if [[ "$ccount" =~ ^[0-9]+$ && "$ccount" -gt 0 ]]; then
+      cjson="$(azdo_api "/${WI_PROJECT}/_apis/wit/workItems/${id}/comments?api-version=7.1-preview.3" "$pat" soft || true)"
+      if [[ -n "$cjson" ]]; then
+        echo
+        echo "--- Comentários (${ccount}) ---"
+        jq -r '.comments[]? | "[\(.createdBy.displayName) @ \(.createdDate)]\n\(.text)\n"' <<<"$cjson" | html_to_text
+      fi
+    fi
+
+    if [[ $want_relacoes -eq 1 ]]; then
+      echo
+      echo "--- Relações ---"
+      jq -r '.relations // [] | .[] | "\(.rel)\t\((.attributes.name) // "")\t\(.url)"' <<<"$json" \
+        | awk -F'\t' 'NF{ n=split($3,a,"/"); printf("- %s %s#%s\n", $1, ($2==""?"":"("$2") "), a[n]) }' \
+        || echo "(sem relações)"
+    fi
+
+    # Anexos (inline no HTML + AttachedFile) baixam por padrão; seção sai no retorno.
+    if [[ $no_anexos -eq 0 ]]; then download_anexos "$json" "$pat" "$id" "$out_dir" "$cjson"; fi
+  } | maybe_save
+}
+
+# Baixa anexos do work item, de forma idempotente (pula os já baixados), e imprime a
+# seção "--- Anexos ---" com os caminhos. Cobre três origens:
+#   1) imagens inline no HTML do Repro Steps/Descrição
+#   2) imagens inline no HTML dos COMENTÁRIOS (evidência costuma vir por aí)
+#   3) relations AttachedFile
+# Dedup por GUID do anexo (a mesma imagem pode aparecer em mais de uma origem).
+download_anexos() {
+  local json="$1" pat="$2" id="$3" out_dir="$4" cjson="${5:-}"
+  local inline rels all
+  inline="$(jq -r '(.fields["Microsoft.VSTS.TCM.ReproSteps"] // "") + (.fields["System.Description"] // "")' <<<"$json" \
+            | grep -oE '_apis/wit/attachments/[^"]+' || true)"
+  if [[ -n "$cjson" ]]; then
+    inline="$inline
+$(jq -r '[.comments[]?.text] | join(" ")' <<<"$cjson" 2>/dev/null | grep -oE '_apis/wit/attachments/[^"]+' || true)"
+  fi
+  rels="$(jq -r '.relations // [] | .[] | select(.rel=="AttachedFile") | .url' <<<"$json" || true)"
+  all="$(printf '%s\n%s\n' "$inline" "$rels" | sed '/^$/d' \
+         | awk '{ k=$0; if (match($0,/attachments\/[0-9a-fA-F-]+/)) k=substr($0,RSTART,RLENGTH); if(!seen[k]++) print }')"
+  [[ -z "$all" ]] && return 0
+
+  mkdir -p "$out_dir"
+  echo
+  echo "--- Anexos (${out_dir%/}) ---"
+  local u i=0 dest fname code
+  while IFS= read -r u; do
+    [[ -z "$u" ]] && continue
+    [[ "$u" != http* ]] && u="https://dev.azure.com/${WI_ORG}/${u#/}"
+    i=$((i+1))
+    fname="$(printf '%s' "$u" | grep -oE 'fileName=[^&]+' | sed 's/^fileName=//' || true)"
+    [[ -z "$fname" ]] && fname="anexo${i}.bin"
+    dest="${out_dir%/}/wi${id}_${i}_${fname}"
+    if [[ -f "$dest" ]]; then
+      echo "  $dest (já baixado)"
+      continue
+    fi
+    code="$(curl -sS -u ":${pat}" "$u" -o "$dest" -w '%{http_code}' || echo 000)"
+    if [[ "$code" == "200" ]]; then
+      echo "  $dest ($(stat -c%s "$dest" 2>/dev/null || echo '?') bytes)"
+    else
+      echo "  [falhou HTTP $code] $u"
+      rm -f "$dest"
+    fi
+  done <<<"$all"
+}
+
+# ────────────────────────────────────────────────────────────────
+# Subcomando: config (mostra a config resolvida p/ este projeto)
+# ────────────────────────────────────────────────────────────────
+cmd_config() {
+  local root envf pat_name pat_val
+  root="$(_dx_project_root)"
+  envf="${DX_ENV_FILE:-$root/.env}"
+  pat_name="$WI_PAT_VAR"
+  pat_val="$(grep -E "^[[:space:]]*${pat_name}=" "$envf" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+
+  echo "Projeto:      $root"
+  echo "Fonte:        .env $([[ -f $envf ]] && echo "(ok: $envf)" || echo '(ausente)')"
+  echo
+  echo "PostgreSQL"
+  echo "  DX_PG_CONTAINER   $PG_CONTAINER"
+  echo "  DX_PG_USER        $PG_USER"
+  echo "  DX_PG_DB          ${PG_DB:-<NÃO DEFINIDO — obrigatório>}"
+  echo "  DX_PG_SSH         ${PG_SSH:-<local>}"
+  echo
+  echo "App (yii / logs)"
+  echo "  DX_APP_CONTAINER  $APP_CONTAINER"
+  echo "  DX_APP_DIR        $APP_DIR"
+  echo "  DX_YII_BIN        $YII_BIN"
+  echo "  DX_LOG_PATH       $LOG_PATH"
+  echo
+  echo "Azure DevOps (wi)"
+  # Marca o que veio do remote em vez do .env — evita caçar a chave num arquivo
+  # onde ela nunca esteve.
+  local org_src="" proj_src=""
+  [[ -n "$WI_ORG"     && -z "${DX_AZDO_ORG:-}"     ]] && org_src="   (do remote git)"
+  [[ -n "$WI_PROJECT" && -z "${DX_AZDO_PROJECT:-}" ]] && proj_src="   (do remote git)"
+  echo "  DX_AZDO_ORG       ${WI_ORG:-<NÃO DEFINIDO>}${org_src}"
+  echo "  DX_AZDO_PROJECT   ${WI_PROJECT:-<NÃO DEFINIDO>}${proj_src}"
+  echo "  ${pat_name}  $([[ -n "$pat_val" ]] && echo "<definido: ${#pat_val} chars>" || echo '<NÃO DEFINIDO>')"
+
+  local faltando=0
+  [[ -z "$PG_DB" ]] && faltando=1
+  [[ -z "$WI_ORG" || -z "$WI_PROJECT" || -z "$pat_val" ]] && faltando=1
+  if [[ $faltando -eq 1 ]]; then
+    echo
+    warn "config incompleta — veja 'Configuração por projeto' no README do dx"
+    info "adicione as chaves DX_* faltantes ao .env do projeto (formato KEY=value)"
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────
+# Subcomando: yii (console do framework dentro do container do app)
+# ────────────────────────────────────────────────────────────────
+precheck_app_container() {
+  if ! docker info >/dev/null 2>&1; then
+    die "Docker não está acessível. Verifique se o daemon está rodando."
+  fi
+  if ! docker ps --format '{{.Names}}' | grep -qx "$APP_CONTAINER"; then
+    error "container do app '$APP_CONTAINER' não está rodando."
+    info  "containers ativos:"
+    docker ps --format '  - {{.Names}}' >&2 || true
+    info  "ajuste com DX_APP_CONTAINER=<nome> (no .env do projeto)"
+    exit 1
+  fi
+}
+
+cmd_yii() {
+  [[ $# -eq 0 ]] && die "uso: dx yii <comando> [args]   (ex: dx yii migrate)"
+  precheck_app_container
+
+  # TTY só quando há terminal: permite prompts (ex.: confirmação do migrate) para
+  # humanos, e evita "the input device is not a TTY" quando roda via pipe/agente.
+  local -a tty=(-i)
+  [[ -t 0 ]] && tty=(-it)
+
+  local stderr_file rc=0
+  stderr_file="$(mktemp)"
+  docker exec "${tty[@]}" -w "$APP_DIR" "$APP_CONTAINER" php "$YII_BIN" "$@" \
+    2>"$stderr_file" | maybe_save || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    error "yii falhou (exit $rc) em '$APP_CONTAINER'"
+    info  "comando: php $YII_BIN $*"
+    if [[ -s "$stderr_file" ]]; then report_block "stderr do yii" < "$stderr_file"; fi
+    rm -f "$stderr_file"
+    exit "$rc"
+  fi
+  if [[ -s "$stderr_file" ]]; then report_block "avisos do yii" < "$stderr_file"; fi
+  rm -f "$stderr_file"
+}
+
+# ────────────────────────────────────────────────────────────────
+# Subcomando: logs (log do app, sem o ruído de stack trace de dependências)
+# ────────────────────────────────────────────────────────────────
+# Colapsa runs de frames "#N /caminho/vendor/..." preservando os frames do
+# projeto — que são justamente os que apontam onde está o bug.
+collapse_vendor_frames() {
+  awk -v mark="$VENDOR_MARK" '
+    /^#[0-9]+ / && index($0, mark) > 0 { v++; next }
+    {
+      if (v) { printf("  [... %d frames de dependências omitidos ...]\n", v); v = 0 }
+      print
+    }
+    END { if (v) printf("  [... %d frames de dependências omitidos ...]\n", v) }
+  '
+}
+
+cmd_logs() {
+  local n=100 only_errors=0 file="$LOG_PATH"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n)        n="${2:-}"; [[ "$n" =~ ^[0-9]+$ ]] || die "-n requer um inteiro"; shift 2 ;;
+      --errors)  only_errors=1; shift ;;
+      --file)    file="${2:-}"; [[ -z "$file" ]] && die "--file requer um caminho"; shift 2 ;;
+      *)         die "flag desconhecida em logs: $1 (use -n N | --errors | --file <path>)" ;;
+    esac
+  done
+
+  # Caminho relativo → resolve a partir da raiz do projeto (o dx é global).
+  [[ "$file" != /* ]] && file="$(_dx_project_root)/$file"
+  [[ -f "$file" ]] || die "log não encontrado: $file (ajuste DX_LOG_PATH no .env)"
+
+  local -a filter=(cat)
+  [[ $only_errors -eq 1 ]] && filter=(grep -E '\[error\]')
+
+  info "log: $file (últimas $n linhas)"
+  tail -n "$n" "$file" | "${filter[@]}" | collapse_vendor_frames | maybe_save
+}
+
+# ────────────────────────────────────────────────────────────────
+# Parsing de flags globais
+# ────────────────────────────────────────────────────────────────
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --raw)        RAW=1; shift ;;
+    --full)       FULL=1; shift ;;
+    --save)       SAVE_FILE="${2:-}"; [[ -z "$SAVE_FILE" ]] && die "--save requer um caminho"; shift 2 ;;
+    --max-lines)  MAX_LINES="${2:-}"; [[ "$MAX_LINES" =~ ^[0-9]+$ ]] || die "--max-lines requer um inteiro"; shift 2 ;;
+    --host)       PG_SSH="${2:-}"; [[ -z "$PG_SSH" ]] && die "--host requer um host ssh (ex: user@servidor)"; shift 2 ;;
+    -h|--help)    print_help; exit 0 ;;
+    *)            ARGS+=("$1"); shift ;;
+  esac
+done
+
+[[ ${#ARGS[@]} -eq 0 ]] && { print_help; exit 1; }
+set -- "${ARGS[@]}"
+
+sub="$1"; shift
+case "$sub" in
+  pg)   cmd_pg   "$@" ;;
+  ssh)  cmd_ssh  "$@" ;;
+  wi)   cmd_wi   "$@" ;;
+  yii)  cmd_yii  "$@" ;;
+  logs) cmd_logs "$@" ;;
+  config) cmd_config "$@" ;;
+  *)    die "subcomando desconhecido: $sub (use: pg | ssh | wi | yii | logs | config)" ;;
+esac

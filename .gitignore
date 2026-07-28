@@ -1,0 +1,21 @@
+# Segredos / config local — nunca versionar
+.env
+*.pat
+*.token
+
+# Anexos de work item baixados por engano dentro do repo (dx wi --dir .)
+wi[0-9]*_*
+
+# Logs / temporários
+*.log
+*.tmp
+*.bak
+*~
+
+# OS / editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
