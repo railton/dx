@@ -67,7 +67,7 @@ Helpers reutilizáveis: `die`/`error`/`warn`/`info`, `report_block` (bloco verme
 ## Gotchas (domínio)
 
 - **`strip_ssh_noise` corrompe dados**, não só logs: ele remove prefixos que *parecem* timestamp. Por isso o **pg remoto NÃO passa por ele** — senão linhas de dados iniciadas por data seriam mutiladas.
-- **pg remoto** (`--host` / `DX_PG_SSH`): `ssh → docker exec -i psql -f -`, com a query indo por **stdin** (evita inferno de aspas) e o comando remoto quotado por `shq`.
+- **pg remoto** (`--host` / `DX_PG_SSH`): `ssh → docker exec -i psql -f -`, com a query indo por **stdin** (evita inferno de aspas) e o comando remoto quotado por `shq`. **Limitação conhecida e assumida:** `--host` troca só a máquina — container/user/db continuam vindo do `.env` local, e o `dx` não inspeciona o host. Num servidor com vários ambientes, container homônimo de outro ambiente responde sem aviso. Se um dia isso virar feature (perfil por ambiente, `--env`), o requisito é **apontar explícito**, nunca adivinhar o alvo remoto.
 - **PAT nunca é ecoado.** É lido do `.env` do projeto (chave `DX_AZDO_PAT`) e passado via `curl -u :"$pat"`. Nunca adicione `-v`/echo do token.
 - **O `dx` só lê variáveis do namespace `DX_`.** O filtro do `.env` é `^DX_[A-Z0-9_]+=` e o nome do PAT é fixo (`DX_AZDO_PAT`) — sem indireção que aponte para fora. Nunca reintroduza uma opção que faça o `dx` ler uma variável arbitrária do `.env`: ele não deve ter acesso a segredos de outras ferramentas que compartilham o arquivo. Para reaproveitar um PAT já existente sob outro nome, exporte a ponte no shell (`export DX_AZDO_PAT="$OUTRO"`).
 - **Anexos do `wi`** baixam por padrão em `$TMPDIR/dx-wi-<id>/` — nunca no CWD (é comando de leitura, não deve sujar o repo). Idempotente e com dedup por GUID.

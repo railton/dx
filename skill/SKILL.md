@@ -61,8 +61,38 @@ Container/log vêm da config do projeto (`DX_APP_CONTAINER`, `DX_LOG_PATH`) — 
 em qualquer projeto Yii. Em `dx logs`, os frames do **projeto** são preservados de
 propósito: são eles que apontam onde está o bug.
 
+**`dx yii` e `dx logs` são LOCAIS** — não existe `--host`. Se pedirem console ou log de
+outro servidor, use `dx ssh <host> "<comando>"`; não finja que `dx yii` alcança o remoto.
+
 Regras: valide `Model::tableName()` e colunas antes de afirmar; o modo remoto **não**
 corrompe datas (não aplica o strip do ssh). Fallback cru: `dx --raw pg …`.
+
+## Banco remoto / outro ambiente — NÃO ASSUMIR A CONFIG LOCAL
+
+`--host` troca **só a máquina**. Container, usuário e banco continuam vindo do `.env`
+local: o comando é `ssh <host> 'docker exec -i <DX_PG_CONTAINER> psql -U <DX_PG_USER>
+-d <DX_PG_DB>'`. Um servidor pode hospedar vários ambientes (dev/hml/staging), e o `dx`
+não inspeciona o host — se existir container de mesmo nome de OUTRO ambiente, a query
+roda no lugar errado **sem aviso**.
+
+Ao receber "veja X no banco de hml/staging/produção":
+
+1. **Descubra o alvo real, não deduza:** `dx ssh <host> "docker ps --format '{{.Names}}'"`.
+2. **Aponte explicitamente**, sobrescrevendo por comando (o export vence o `.env` e não
+   altera a config local):
+   ```bash
+   DX_PG_CONTAINER=<container> DX_PG_DB=<banco> dx pg --host <host> "SELECT ..."
+   ```
+   Se o banco for derivado (`DX_PG_DB=${POSTGRES_DB}`), basta a variável de ambiente do
+   projeto (ex.: `APP_ENV=hml`) que o nome acompanha.
+3. **Confirme antes de rodar:** mostre ao usuário host + container + banco resolvidos
+   (`dx config` com as mesmas variáveis na frente) e só então execute. Ambiente
+   compartilhado não é lugar de tentativa e erro.
+4. **Escrita (`UPDATE`/`DELETE`/DDL) exige autorização explícita** para o ambiente em
+   questão — o auto-`LIMIT` só protege `SELECT`. Autorização para um ambiente não vale
+   para outro.
+5. Se o resultado vier vazio ou estranho, **suspeite do alvo antes da query**: container
+   de outro ambiente responde normalmente, só com os dados errados.
 
 ## Azure DevOps work item (`dx wi`)
 

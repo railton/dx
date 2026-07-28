@@ -185,6 +185,31 @@ A query trafega por **stdin** (`psql -f -`), então não há problema de aspas. 
 (de preferência por chave) e permissão de `docker` no host. `dx pg` (sem query) abre o
 psql interativo remoto via `ssh -t`.
 
+> **`--host` troca só a máquina — não o ambiente.** Container, usuário e banco continuam
+> vindo da config **local**: o comando montado é
+> `ssh <host> 'docker exec -i <DX_PG_CONTAINER> psql -U <DX_PG_USER> -d <DX_PG_DB>'`.
+> O `dx` não inspeciona o host remoto e não tem como saber que o nome certo lá é outro.
+
+Isso importa quando **um mesmo servidor hospeda vários ambientes** (dev, hml, staging).
+Em geral o erro é barulhento — o container não existe naquele host, ou o banco não existe.
+Mas se o host tiver um container com o **mesmo nome** pertencendo a outro ambiente, a query
+roda no lugar errado sem aviso. Então descubra os nomes antes e aponte explicitamente:
+
+```bash
+dx ssh user@srv "docker ps --format '{{.Names}}'"          # 1. o que existe lá
+
+DX_PG_CONTAINER=pg-hml DX_PG_DB=meuapp_hml \
+  dx pg --host user@srv "SELECT ..."                       # 2. aponta explícito
+```
+
+Variável exportada vence o `.env` e vale só para aquele comando — a config local fica
+intacta. Se o nome do banco for derivado (`DX_PG_DB=${POSTGRES_DB}` com
+`POSTGRES_DB=meuapp_${APP_ENV}`), basta `APP_ENV=hml` que ele acompanha sozinho.
+Confira com `dx config` (mesmas variáveis na frente) antes de rodar a query.
+
+**`dx yii` e `dx logs` não têm modo remoto** — atuam sempre no container/repo local. Para
+console ou log de outro servidor, use `dx ssh`.
+
 #### Buscar tabela/coluna no schema
 
 Evita query quebrada por nome errado — responde na hora se a coluna existe:
