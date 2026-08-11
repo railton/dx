@@ -286,18 +286,32 @@ dx ssh prod "ps aux | grep php-fpm"
 
 ### Work item do Azure DevOps
 
-Lê um work item (Bug/Task/etc.) pela REST API, já em texto limpo (campos + Repro
-Steps/Descrição + comentários), e **baixa os anexos/prints automaticamente** —
-inclusive imagens **inline** coladas no HTML do Repro Steps.
+Lê um work item (Bug/Task/etc.) pela REST API **por inteiro**, já em texto limpo, e
+**baixa os anexos/prints automaticamente** — inclusive imagens **inline** coladas no
+HTML de qualquer campo.
+
+O retorno tem, nesta ordem: cabeçalho (tipo, título, estado, área, sprint,
+responsável), Repro Steps/Descrição, **um bloco por campo preenchido** (critérios de
+aceite, protótipo, campos custom do processo), comentários e anexos.
 
 ```bash
-dx wi 1234                          # campos + repro + comentários + baixa anexos (auto)
+dx wi 1234                          # work item completo + baixa anexos (auto)
 dx wi 1234 --relacoes               # + relações (pai/filho/relacionados)
 dx wi 1234 --no-anexos              # só texto (não baixa nada — bom p/ pipe/grep)
 dx wi 1234 --dir /tmp/wi            # baixa anexos num diretório específico
 dx wi 1234 --json                   # JSON cru da API (pra pipar em jq)
 dx --raw wi 1234                    # texto integral, sem truncar linhas longas
 ```
+
+**Campos custom:** o processo do time costuma guardar requisito fora da descrição, e
+esses campos chegam da API como GUID (`Custom.<uuid>`). O `dx` resolve o rótulo real
+("Protótipo", "Critérios de Aceite") na lista de campos da organização, cacheada por 7
+dias em `$TMPDIR/dx-azdo-fields-<org>-<projeto>.json`. Sem rede nem cache, cai para o
+`referenceName` — nunca omite o campo.
+
+**Comentários e anexos saem sempre**, mesmo zerados (`--- Comentários (0) --- /
+(nenhum)`): "não tem" e "não olhei" são conclusões diferentes para quem lê a task.
+Com `--no-anexos` a contagem continua aparecendo, só o download é pulado.
 
 **Anexos:** por padrão baixam para `$TMPDIR/dx-wi-<id>/` (não sujam o diretório
 atual), e a seção `--- Anexos ---` no retorno lista os caminhos locais. É
@@ -315,7 +329,7 @@ anexos faz parte do mesmo escopo).
 | `--raw` | Desliga o pipeline de redução (output cru; em `wi`, texto integral) |
 | `--full` | Não injeta `LIMIT 100` em SELECTs sem LIMIT |
 | `--save <arquivo>` | Salva output **completo** em arquivo; devolve só sumário (head 10 + tail 10) |
-| `--max-lines N` | Override do limite antes do head/tail sample (default: 80) |
+| `--max-lines N` | Override do limite antes do head/tail sample (default: 80; `wi`: 1000) |
 | `-h`, `--help` | Help |
 
 ### Variáveis de ambiente
@@ -331,7 +345,7 @@ anexos faz parte do mesmo escopo).
 | `DX_YII_BIN` | `yii` | Binário do console, relativo a `DX_APP_DIR` |
 | `DX_LOG_PATH` | `app/runtime/logs/app.log` | Log do app, relativo à raiz do projeto |
 | `DX_VENDOR_MARK` | `/vendor/` | Marca de frame de dependência a colapsar |
-| `DX_MAX_LINES` | `80` | Linhas antes de aplicar head/tail sample |
+| `DX_MAX_LINES` | `80` | Linhas antes de aplicar head/tail sample (o `wi` sobe pra 1000 sem override) |
 | `DX_AZDO_ORG` | _(auto: do remote git, se `dev.azure.com`)_ | Organização do Azure DevOps |
 | `DX_AZDO_PROJECT` | _(auto: do remote git, se `dev.azure.com`)_ | Projeto/team project |
 | `DX_ENV_FILE` | _(auto: `.env` na raiz do repo atual)_ | De onde ler a config e o PAT |

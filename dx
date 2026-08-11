@@ -17,8 +17,10 @@
 #   dx config                         Mostra a config resolvida p/ este projeto e o que falta
 #   dx logs [-n N] [--errors]         Log do app colapsando frames de dependências
 #                                     (preserva os frames do projeto). --file <path> p/ outro log.
-#   dx wi  <id>                       Work item do Azure DevOps (campos + repro + comentários);
-#                                     baixa anexos/prints (inline e AttachedFile) automaticamente
+#   dx wi  <id>                       Work item do Azure DevOps COMPLETO: cabeçalho, repro/descrição,
+#                                     TODOS os campos preenchidos (inclusive custom, ex. "Protótipo"),
+#                                     comentários e anexos — seções de comentário/anexo saem mesmo
+#                                     vazias, e os prints (inline e AttachedFile) baixam sozinhos
 #   dx wi  <id> --relacoes            + lista relações (pai/filho/relacionados)
 #   dx wi  <id> --no-anexos           não baixa anexos (só texto, p/ pipe/grep)
 #   dx wi  <id> --dir <D>             baixa anexos em D (default: $TMPDIR/dx-wi-<id>)
@@ -28,7 +30,7 @@
 #   --raw                 Desliga o pipeline de redução (output cru / texto integral)
 #   --full                Não injeta LIMIT 100 em queries pg sem LIMIT
 #   --save <arquivo>      Salva output completo em arquivo, devolve só sumário
-#   --max-lines N         Override do limite de linhas (default: 80)
+#   --max-lines N         Override do limite de linhas (default: 80; wi: 1000)
 #   -h | --help           Mostra este help
 #
 # Config por projeto:
@@ -60,7 +62,7 @@
 #   DX_YII_BIN       (default: yii)  binário do console Yii, relativo a DX_APP_DIR
 #   DX_LOG_PATH      (default: app/runtime/logs/app.log)  log do app, relativo à raiz do projeto
 #   DX_VENDOR_MARK   (default: /vendor/)  marca de frame de dependência a colapsar
-#   DX_MAX_LINES     (default: 80)
+#   DX_MAX_LINES     (default: 80; o wi usa 1000 quando não há override)
 #   DX_AZDO_ORG      (auto: do remote git se for dev.azure.com)  org do Azure DevOps
 #   DX_AZDO_PROJECT  (auto: do remote git se for dev.azure.com)  projeto/team project
 #   DX_ENV_FILE      (default: .env na raiz do repo atual) de onde ler config/PAT
@@ -164,6 +166,8 @@ YII_BIN="${DX_YII_BIN:-yii}"                            # binário do console Yi
 LOG_PATH="${DX_LOG_PATH:-app/runtime/logs/app.log}"     # log do app (relativo à raiz do projeto)
 VENDOR_MARK="${DX_VENDOR_MARK:-/vendor/}"               # marca de frame de dependência (colapsado)
 MAX_LINES="${DX_MAX_LINES:-80}"
+MAX_LINES_SET=0      # 1 = veio de --max-lines/DX_MAX_LINES (subcomando não sobrescreve)
+[[ -n "${DX_MAX_LINES:-}" ]] && MAX_LINES_SET=1
 LONG_LINE=180        # trunca conteúdo de célula/linha acima desse
 HEAD_TAIL=20         # quando truncar, mantém head + tail
 RAW=0
@@ -568,6 +572,40 @@ azdo_api() {
   cat "$body_file"; rm -f "$body_file"
 }
 
+# Chaves dos campos que carregam texto PRÓPRIO do work item (custom do processo,
+# critérios de aceite, protótipo…), fora o metadata do sistema e o que já foi
+# impresso no cabeçalho/repro. Requisito costuma morar num campo custom — por
+# isso a varredura é sobre TODOS os campos, não sobre uma lista fixa.
+_wi_extra_keys() {
+  jq -r '
+    .fields
+    | to_entries
+    | map(select(.value | type == "string"))
+    | map(select((.value | gsub("<[^>]*>"; "") | gsub("&nbsp;"; " ") | gsub("\\s"; "")) != ""))
+    | map(select(.key | test("^System\\.|^WEF_|^Microsoft\\.VSTS\\.TCM\\.ReproSteps$|^Microsoft\\.VSTS\\..*(Date|By)$|^Microsoft\\.VSTS\\.Common\\.(StackRank|Priority|ValueArea|Risk|BacklogPriority|Severity)$") | not))
+    | .[].key
+  ' <<<"$1"
+}
+
+# Rótulo legível de um campo: campo custom vem como GUID (Custom.<uuid>), que não
+# diz nada. A lista de campos da org resolve o nome ("Protótipo") e é cacheada por
+# 7 dias; sem cache nem rede, devolve o referenceName mesmo.
+azdo_field_label() {
+  local key="$1" pat="$2"
+  local f="${TMPDIR:-/tmp}/dx-azdo-fields-${WI_ORG}-${WI_PROJECT}.json"
+  if [[ ! -s "$f" || -n "$(find "$f" -mtime +7 2>/dev/null)" ]]; then
+    local body
+    body="$(azdo_api "/${WI_PROJECT}/_apis/wit/fields?api-version=7.1" "$pat" soft || true)"
+    if [[ -n "$body" ]]; then printf '%s' "$body" >"$f"; fi
+  fi
+  local name=""
+  if [[ -s "$f" ]]; then
+    name="$(jq -r --arg k "$key" '[.value[]? | select(.referenceName==$k) | .name] | first // ""' "$f" 2>/dev/null || true)"
+  fi
+  if [[ -z "$name" || "$name" == "null" ]]; then name="$key"; fi
+  printf '%s' "$name"
+}
+
 # HTML → texto legível. Usa python3 (decodifica entidades) ou cai p/ sed best-effort.
 html_to_text() {
   if command -v python3 >/dev/null 2>&1; then
@@ -612,6 +650,11 @@ cmd_wi() {
     exit 1
   fi
 
+  # Work item não é log: o conteúdo é curto, denso e sem repetição, e a amostragem
+  # head/tail de 80 linhas engolia justamente o miolo (campos e comentários do meio).
+  # Sem --max-lines explícito, o teto sobe — a task tem que sair inteira.
+  if [[ $MAX_LINES_SET -eq 0 ]]; then MAX_LINES=1000; fi
+
   local pat; pat="$(load_azdo_pat)"
   local json
   json="$(azdo_api "/${WI_PROJECT}/_apis/wit/workItems/${id}?\$expand=all&api-version=7.1" "$pat")"
@@ -641,15 +684,33 @@ cmd_wi() {
     repro="$(jq -r '.fields["Microsoft.VSTS.TCM.ReproSteps"] // .fields["System.Description"] // ""' <<<"$json" | html_to_text)"
     [[ -n "$repro" ]] && echo "$repro" || echo "(vazio)"
 
+    # Demais campos preenchidos (protótipo, critérios de aceite, custom do processo).
+    local extra_keys k label
+    extra_keys="$(_wi_extra_keys "$json")"
+    if [[ -n "$extra_keys" ]]; then
+      while IFS= read -r k; do
+        [[ -z "$k" ]] && continue
+        label="$(azdo_field_label "$k" "$pat")"
+        echo
+        echo "--- ${label} ---"
+        jq -r --arg k "$k" '.fields[$k] // ""' <<<"$json" | html_to_text
+      done <<<"$extra_keys"
+    fi
+
     local ccount cjson=""
     ccount="$(jq -r '.fields["System.CommentCount"] // 0' <<<"$json")"
+    echo
     if [[ "$ccount" =~ ^[0-9]+$ && "$ccount" -gt 0 ]]; then
       cjson="$(azdo_api "/${WI_PROJECT}/_apis/wit/workItems/${id}/comments?api-version=7.1-preview.3" "$pat" soft || true)"
+      echo "--- Comentários (${ccount}) ---"
       if [[ -n "$cjson" ]]; then
-        echo
-        echo "--- Comentários (${ccount}) ---"
         jq -r '.comments[]? | "[\(.createdBy.displayName) @ \(.createdDate)]\n\(.text)\n"' <<<"$cjson" | html_to_text
+      else
+        echo "(falha ao buscar os comentários)"
       fi
+    else
+      echo "--- Comentários (0) ---"
+      echo "(nenhum)"
     fi
 
     if [[ $want_relacoes -eq 1 ]]; then
@@ -660,33 +721,49 @@ cmd_wi() {
         || echo "(sem relações)"
     fi
 
-    # Anexos (inline no HTML + AttachedFile) baixam por padrão; seção sai no retorno.
-    if [[ $no_anexos -eq 0 ]]; then download_anexos "$json" "$pat" "$id" "$out_dir" "$cjson"; fi
+    # Anexos: a seção sai SEMPRE (inclusive vazia) — "não vi anexo" e "não tem
+    # anexo" são conclusões diferentes para quem lê a task.
+    local anexos n_anexos=0
+    anexos="$(_wi_anexos_urls "$json" "$cjson")"
+    if [[ -n "$anexos" ]]; then n_anexos="$(printf '%s\n' "$anexos" | wc -l | tr -d ' ')"; fi
+    echo
+    if [[ "$n_anexos" -eq 0 ]]; then
+      echo "--- Anexos (0) ---"
+      echo "(nenhum)"
+    elif [[ $no_anexos -eq 1 ]]; then
+      echo "--- Anexos (${n_anexos}) ---"
+      echo "(não baixados: --no-anexos)"
+    else
+      download_anexos "$anexos" "$pat" "$id" "$out_dir"
+    fi
   } | maybe_save
 }
 
-# Baixa anexos do work item, de forma idempotente (pula os já baixados), e imprime a
-# seção "--- Anexos ---" com os caminhos. Cobre três origens:
-#   1) imagens inline no HTML do Repro Steps/Descrição
+# URLs dos anexos do work item, dedup por GUID (a mesma imagem pode vir de mais de
+# uma origem). Cobre três:
+#   1) imagens inline em QUALQUER campo de texto (repro, descrição, custom/protótipo)
 #   2) imagens inline no HTML dos COMENTÁRIOS (evidência costuma vir por aí)
 #   3) relations AttachedFile
-# Dedup por GUID do anexo (a mesma imagem pode aparecer em mais de uma origem).
-download_anexos() {
-  local json="$1" pat="$2" id="$3" out_dir="$4" cjson="${5:-}"
-  local inline rels all
-  inline="$(jq -r '(.fields["Microsoft.VSTS.TCM.ReproSteps"] // "") + (.fields["System.Description"] // "")' <<<"$json" \
+_wi_anexos_urls() {
+  local json="$1" cjson="${2:-}"
+  local inline rels
+  inline="$(jq -r '[.fields[]? | select(type=="string")] | join(" ")' <<<"$json" \
             | grep -oE '_apis/wit/attachments/[^"]+' || true)"
   if [[ -n "$cjson" ]]; then
     inline="$inline
 $(jq -r '[.comments[]?.text] | join(" ")' <<<"$cjson" 2>/dev/null | grep -oE '_apis/wit/attachments/[^"]+' || true)"
   fi
   rels="$(jq -r '.relations // [] | .[] | select(.rel=="AttachedFile") | .url' <<<"$json" || true)"
-  all="$(printf '%s\n%s\n' "$inline" "$rels" | sed '/^$/d' \
-         | awk '{ k=$0; if (match($0,/attachments\/[0-9a-fA-F-]+/)) k=substr($0,RSTART,RLENGTH); if(!seen[k]++) print }')"
-  [[ -z "$all" ]] && return 0
+  printf '%s\n%s\n' "$inline" "$rels" | sed '/^$/d' \
+    | awk '{ k=$0; if (match($0,/attachments\/[0-9a-fA-F-]+/)) k=substr($0,RSTART,RLENGTH); if(!seen[k]++) print }'
+}
+
+# Baixa os anexos ($1 = lista de URLs), de forma idempotente (pula os já baixados),
+# e imprime a seção "--- Anexos ---" com os caminhos.
+download_anexos() {
+  local all="$1" pat="$2" id="$3" out_dir="$4"
 
   mkdir -p "$out_dir"
-  echo
   echo "--- Anexos (${out_dir%/}) ---"
   local u i=0 dest fname code
   while IFS= read -r u; do
@@ -842,7 +919,7 @@ while [[ $# -gt 0 ]]; do
     --raw)        RAW=1; shift ;;
     --full)       FULL=1; shift ;;
     --save)       SAVE_FILE="${2:-}"; [[ -z "$SAVE_FILE" ]] && die "--save requer um caminho"; shift 2 ;;
-    --max-lines)  MAX_LINES="${2:-}"; [[ "$MAX_LINES" =~ ^[0-9]+$ ]] || die "--max-lines requer um inteiro"; shift 2 ;;
+    --max-lines)  MAX_LINES="${2:-}"; [[ "$MAX_LINES" =~ ^[0-9]+$ ]] || die "--max-lines requer um inteiro"; MAX_LINES_SET=1; shift 2 ;;
     --host)       PG_SSH="${2:-}"; [[ -z "$PG_SSH" ]] && die "--host requer um host ssh (ex: user@servidor)"; shift 2 ;;
     -h|--help)    print_help; exit 0 ;;
     *)            ARGS+=("$1"); shift ;;

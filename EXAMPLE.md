@@ -213,6 +213,12 @@ Criado   : 2026-07-23T13:11:47.987Z
 O cliente relatou não conseguir emitir o relatório do mês de Junho.
 Após análise, o mês não aparece na lista de seleção. (...)
 
+--- Critérios de Aceite ---
+Dado que o mês possua movimento, deve aparecer na lista. (...)
+
+--- Protótipo ---
+Campo Mês: combo com os 12 meses do exercício corrente.
+
 --- Comentários (2) ---
 [fulano.silva @ 2026-07-24] Valida em homologação, por favor.
 [beltrano.souza @ 2026-07-23] Reproduzido no ambiente de testes.
@@ -232,9 +238,11 @@ dx wi 1234 --json | jq    # payload cru da API (qualquer campo)
 dx --raw wi 1234          # texto integral, sem truncar linhas longas
 ```
 
-Detalhes: o HTML vira texto legível; prints inline baixam pra `/tmp/dx-wi-<id>/`
-(não sujam o CWD) de forma idempotente; o PAT é lido do `.env` do projeto e
-**nunca é ecoado**.
+Detalhes: o HTML vira texto legível; **todo campo preenchido vira um bloco** (campo
+custom do processo aparece com o rótulo real, não com o GUID da API); as seções de
+comentários e anexos saem mesmo zeradas, pra não confundir "não tem" com "não olhei";
+prints inline baixam pra `/tmp/dx-wi-<id>/` (não sujam o CWD) de forma idempotente; o
+PAT é lido do `.env` do projeto e **nunca é ecoado**.
 
 ---
 
@@ -245,7 +253,7 @@ Detalhes: o HTML vira texto legível; prints inline baixam pra `/tmp/dx-wi-<id>/
 | `--raw` | Desliga a redução (output cru; em `wi`, texto integral) |
 | `--full` | Não injeta `LIMIT 100` (só `pg`) |
 | `--save <arquivo>` | Salva o output completo em arquivo, devolve só o sumário |
-| `--max-lines N` | Ajusta o limite da amostragem head/tail (default: 80) |
+| `--max-lines N` | Ajusta o limite da amostragem head/tail (default: 80; `wi`: 1000, pra task sair inteira) |
 | `--host user@srv` | Roda o `pg` num host remoto |
 
 Config por projeto (container/db/org/PAT) via bloco `DX_*` no `.env` da raiz do repo — ver `README.md`.

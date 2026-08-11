@@ -28,8 +28,9 @@ Antes de detalhes, rode `dx --help` (e veja o `EXAMPLE.md` no repositório do dx
   ferramenta MCP para o banco.
 - **Banco remoto** (troubleshooting em outro servidor) → `dx pg --host user@srv "<query>"`
   (roda o psql via `ssh → docker exec -i`, query por stdin). Ou fixe `DX_PG_SSH` na config do projeto.
-- **Chamado / work item do Azure DevOps** → `dx wi <id>` (traz campos, repro, comentários
-  e baixa os prints inline automaticamente).
+- **Chamado / work item do Azure DevOps** → `dx wi <id>` (task inteira: repro, TODOS os
+  campos preenchidos — inclusive os custom, tipo "Protótipo" —, comentários, anexos; e
+  baixa os prints inline automaticamente).
 - **Logs / comandos num servidor** → `dx ssh <host> "<comando>"` (remove timestamp/host/PID + dedup).
 - **Console do framework** (migrations, cache, filas) → `dx yii <cmd>` em vez de `docker exec … ./yii`.
 - **Log do app** (erro/exceção) → `dx logs` (colapsa stack de dependências, mantém frames do projeto).
@@ -102,11 +103,21 @@ Ao receber "veja X no banco de hml/staging/produção":
 ## Azure DevOps work item (`dx wi`)
 
 ```bash
-dx wi <id>                 # campos + repro + comentários + baixa anexos
+dx wi <id>                 # work item COMPLETO: cabeçalho + repro/descrição + todos os
+                           # campos preenchidos + comentários + anexos (baixa os prints)
 dx wi <id> --relacoes      # + pai/filho
-dx wi <id> --no-anexos     # só texto (p/ grep/pipe)
+dx wi <id> --no-anexos     # só texto (p/ grep/pipe) — ainda diz QUANTOS anexos existem
 dx wi <id> --json | jq     # payload cru da API
 ```
+
+`dx wi <id>` já é a leitura integral da task: além de Repro/Descrição, imprime **cada
+campo preenchido** com o rótulo legível (campo custom do processo — "Protótipo",
+"Critérios de Aceite" — vem como GUID na API e é resolvido pelo nome), e as seções
+`--- Comentários (N) ---` e `--- Anexos (N) ---` saem **mesmo vazias**. Não existe
+"campo que ficou de fora": se a seção não apareceu, o campo está vazio.
+
+Ao analisar uma história/chamado, isso é o suficiente — não presuma que o requisito
+está só na descrição, e leia também as tasks pai/filhas (`--relacoes`) quando houver.
 
 Os prints inline vão para `/tmp/dx-wi-<id>/` — para VER as imagens, use `Read` nos
 caminhos listados na seção `--- Anexos ---`. O PAT sai do `.env` do projeto (chave
