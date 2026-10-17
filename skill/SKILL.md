@@ -54,8 +54,9 @@ dx pg --find <termo>                                  # busca tabela/coluna no s
 dx yii migrate                    # console Yii no container do app
 dx yii migrate --interactive=0    # sem prompt (agentes/scripts)
 dx yii cache/flush-all
-dx logs -n 200                    # log com stack de dependências colapsada
-dx logs --errors                  # só entradas [error]
+dx logs -n 50                     # últimas 50 ENTRADAS, stack de dependências colapsada
+dx logs --errors                  # só entradas [error], inteiras (cabeçalho + stack)
+dx logs --errors --since 14:30    # erros desde um horário — use antes/depois de testar
 ```
 
 Container/log vêm da config do projeto (`DX_APP_CONTAINER`, `DX_LOG_PATH`) — funciona
@@ -134,7 +135,8 @@ dx --raw ssh <host> "<cmd>"    # saída remota crua (sem filtro)
 ## Flags globais
 
 `--raw` (sem redução) · `--full` (sem auto-LIMIT) · `--save <arq>` (dump completo em arquivo) ·
-`--max-lines N` · `--host user@srv` (pg remoto).
+`--max-lines N` · `--host user@srv` (pg remoto, **somente leitura**) · `--write` (libera escrita no remoto —
+só com pedido explícito do usuário).
 
 ## Seleção de modelo
 

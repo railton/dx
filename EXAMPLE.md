@@ -23,7 +23,7 @@ auto-`LIMIT 100` em SELECTs e amostragem head/tail em resultados grandes.
 dx pg "SELECT id, nome, status FROM cliente WHERE id IN (1, 2)"
 ```
 ```text
-→ auto-LIMIT 100 aplicado (use --full pra desligar)
+⚠ dx: resultado cortado no auto-LIMIT 100 — use --full para tudo   (só quando bateu no teto)
 id	nome	status
 1	Cliente Exemplo	ativo
 2	Outro Cliente	inativo
@@ -122,9 +122,10 @@ Mostra o log colapsando os frames de stack trace de **dependências** (`/vendor/
 **preservando os frames do projeto** — que são os que apontam onde está o bug.
 
 ```bash
-dx logs                 # últimas 100 linhas, filtradas
-dx logs -n 300
-dx logs --errors        # só entradas [error]
+dx logs                 # últimas 20 entradas, cada uma com seu stack
+dx logs -n 50           # -n conta ENTRADAS, não linhas
+dx logs --errors        # só entradas [error], inteiras
+dx logs --errors --since 14:30   # erros a partir de um horário
 dx logs --file /caminho/outro.log
 ```
 
@@ -252,6 +253,7 @@ PAT é lido do `.env` do projeto e **nunca é ecoado**.
 |---|---|
 | `--raw` | Desliga a redução (output cru; em `wi`, texto integral) |
 | `--full` | Não injeta `LIMIT 100` (só `pg`) |
+| `--write` | Libera escrita no `pg` remoto |
 | `--save <arquivo>` | Salva o output completo em arquivo, devolve só o sumário |
 | `--max-lines N` | Ajusta o limite da amostragem head/tail (default: 80; `wi`: 1000, pra task sair inteira) |
 | `--host user@srv` | Roda o `pg` num host remoto |

@@ -17,7 +17,8 @@ Comandos de troubleshooting (consultas SQL, dumps de schema, logs remotos, chama
 - Filtra ruído típico de SSH (timestamps syslog, PIDs em colchetes)
 - Lê work items do Azure DevOps já em texto limpo (HTML → texto) e baixa os prints
 - Reporta erros visíveis (psql/ssh/API) em bloco vermelho — nada de falha silenciosa
-- Injeta `LIMIT 100` automático em SELECTs sem LIMIT (com `--full` para desligar)
+- Injeta `LIMIT 100` automático em `SELECT`/`WITH` sem LIMIT (com `--full` para desligar); só avisa quando o resultado bateu no teto
+- `pg` remoto é **somente leitura** por padrão (o próprio PostgreSQL recusa escrita); `--write` libera
 
 ## Instalação
 
@@ -268,9 +269,10 @@ Mostra o log colapsando os frames de stack trace de **dependências** (`/vendor/
 **preservando os frames do projeto** — que são os que apontam onde está o bug:
 
 ```bash
-dx logs                 # últimas 100 linhas, filtradas
-dx logs -n 300
-dx logs --errors        # só entradas [error]
+dx logs                 # últimas 20 entradas, cada uma com seu stack
+dx logs -n 50           # -n conta ENTRADAS, não linhas
+dx logs --errors        # só entradas [error], inteiras (cabeçalho + stack)
+dx logs --errors --since 14:30   # erros a partir de um horário (hoje) — "algo quebrou desde o teste?"
 dx logs --file /caminho/outro.log
 ```
 
@@ -327,7 +329,8 @@ anexos faz parte do mesmo escopo).
 | Flag | Descrição |
 |---|---|
 | `--raw` | Desliga o pipeline de redução (output cru; em `wi`, texto integral) |
-| `--full` | Não injeta `LIMIT 100` em SELECTs sem LIMIT |
+| `--full` | Não injeta `LIMIT 100` em `SELECT`/`WITH` sem LIMIT |
+| `--write` | Libera escrita no `pg` remoto (somente leitura por padrão) |
 | `--save <arquivo>` | Salva output **completo** em arquivo; devolve só sumário (head 10 + tail 10) |
 | `--max-lines N` | Override do limite antes do head/tail sample (default: 80; `wi`: 1000) |
 | `-h`, `--help` | Help |
@@ -340,6 +343,7 @@ anexos faz parte do mesmo escopo).
 | `DX_PG_USER` | `postgres` | Usuário do banco |
 | `DX_PG_DB` | **obrigatório** | Nome do banco — defina no `.env` (sem default: evita apontar pro banco de outro projeto) |
 | `DX_PG_SSH` | _(vazio)_ | Host SSH p/ rodar o psql remoto (= flag `--host`) |
+| `DX_PG_READONLY` | `0` | `1` força somente leitura também no `pg` local |
 | `DX_APP_CONTAINER` | `app-local` | Container do app (`yii`, `logs`) |
 | `DX_APP_DIR` | `/var/www/html` | Workdir do app no container |
 | `DX_YII_BIN` | `yii` | Binário do console, relativo a `DX_APP_DIR` |

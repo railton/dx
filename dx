@@ -9,14 +9,18 @@
 #   dx pg                             Shell psql interativo (sem filtros)
 #   dx pg  --host <user@srv> "<q>"    Roda o psql via ssh→docker exec no host remoto
 #                                     (ou defina DX_PG_SSH no .env). Mantém TSV/auto-LIMIT;
+#                                     SOMENTE LEITURA por padrão (o servidor recusa escrita);
 #                                     NÃO aplica o strip do ssh (não corrompe datas).
-#   dx pg  --find <termo>             Busca tabela/coluna no schema (evita nome errado)
+#   dx pg  --find <termo>             Busca tabela/coluna em todos os schemas do usuário
 #   dx ssh <host> "<comando>"         Roda comando via SSH com output reduzido
 #   dx yii <comando> [args]           Console Yii dentro do container do app
 #                                     (ex: dx yii migrate). Use --interactive=0 p/ sem prompt.
 #   dx config                         Mostra a config resolvida p/ este projeto e o que falta
-#   dx logs [-n N] [--errors]         Log do app colapsando frames de dependências
-#                                     (preserva os frames do projeto). --file <path> p/ outro log.
+#   dx logs [-n N] [--errors] [--since HH:MM]
+#                                     Últimas N ENTRADAS do log (default 20), cada uma com seu
+#                                     stack, colapsando frames de dependências (preserva os do
+#                                     projeto). --errors: só [error]. --since: só a partir da hora
+#                                     (ou 'AAAA-MM-DD HH:MM'). --file <path> p/ outro log.
 #   dx wi  <id>                       Work item do Azure DevOps COMPLETO: cabeçalho, repro/descrição,
 #                                     TODOS os campos preenchidos (inclusive custom, ex. "Protótipo"),
 #                                     comentários e anexos — seções de comentário/anexo saem mesmo
@@ -28,7 +32,8 @@
 #
 # Flags globais:
 #   --raw                 Desliga o pipeline de redução (output cru / texto integral)
-#   --full                Não injeta LIMIT 100 em queries pg sem LIMIT
+#   --full                Não injeta LIMIT 100 em SELECT/WITH sem LIMIT (só avisa se cortou)
+#   --write               Libera escrita no pg remoto (somente leitura por padrão)
 #   --save <arquivo>      Salva output completo em arquivo, devolve só sumário
 #   --max-lines N         Override do limite de linhas (default: 80; wi: 1000)
 #   -h | --help           Mostra este help
@@ -57,6 +62,7 @@
 #   DX_PG_USER       (default: postgres)
 #   DX_PG_DB         (OBRIGATÓRIO — defina no .env do projeto; sem default)
 #   DX_PG_SSH        (default: vazio) host ssh p/ rodar o psql remoto (= flag --host)
+#   DX_PG_READONLY   (default: 0) 1 = força somente leitura também no pg local
 #   DX_APP_CONTAINER (default: app-local)  container do app (yii/logs)
 #   DX_APP_DIR       (default: /var/www/html)  workdir do app no container
 #   DX_YII_BIN       (default: yii)  binário do console Yii, relativo a DX_APP_DIR
@@ -172,6 +178,8 @@ LONG_LINE=180        # trunca conteúdo de célula/linha acima desse
 HEAD_TAIL=20         # quando truncar, mantém head + tail
 RAW=0
 FULL=0
+PG_WRITE=0          # --write: libera escrita no pg remoto (que é somente leitura por padrão)
+PG_READONLY=0
 SAVE_FILE=""
 
 # ────────────────────────────────────────────────────────────────
@@ -226,6 +234,7 @@ trim_long_lines() {
 dedup_consecutive() {
   awk '
     {
+      if ($0 == prev && $0 ~ /^[[:space:]]*$/) next   # branco repetido: colapsa sem contador
       if ($0 == prev) { count++ }
       else {
         if (NR > 1) {
@@ -286,18 +295,34 @@ maybe_save() {
 # ────────────────────────────────────────────────────────────────
 # Subcomando: pg
 # ────────────────────────────────────────────────────────────────
-inject_limit_if_missing() {
+AUTO_LIMIT=100
+LIMIT_INJECTED=0
+
+# Remove espaço/quebra de linha e `;` do fim — `select 1;\n` + " LIMIT" quebrava a sintaxe.
+_strip_query_tail() {
   local q="$1"
-  if [[ $FULL -eq 1 ]]; then echo "$q"; return; fi
-  # só mexe em SELECT sem LIMIT
-  if [[ "$q" =~ ^[[:space:]]*[Ss][Ee][Ll][Ee][Cc][Tt] ]] && ! [[ "$q" =~ [Ll][Ii][Mm][Ii][Tt][[:space:]]+[0-9]+ ]]; then
-    # remove ; final se houver
-    q="${q%;}"
-    echo "${q} LIMIT 100"
-    info "auto-LIMIT 100 aplicado (use --full pra desligar)"
-  else
-    echo "$q"
+  q="${q%"${q##*[![:space:]]}"}"
+  q="${q%;}"
+  q="${q%"${q##*[![:space:]]}"}"
+  printf '%s' "$q"
+}
+
+# Injeta LIMIT em leitura sem LIMIT: SELECT e WITH (CTE) — exceto CTE que escreve
+# (WITH ... INSERT/UPDATE/DELETE), onde LIMIT no fim é erro de sintaxe.
+# Roda no shell atual (sem $(...)) para LIMIT_INJECTED chegar ao chamador.
+inject_limit_if_missing() {
+  QUERY="$1"
+  LIMIT_INJECTED=0
+  [[ $FULL -eq 1 ]] && return 0
+  local q; q="$(_strip_query_tail "$QUERY")"
+  local u="${q^^}"
+  [[ "$u" =~ LIMIT[[:space:]]+[0-9]+ ]] && return 0
+  if [[ "$u" =~ ^[[:space:]]*SELECT ]] \
+     || { [[ "$u" =~ ^[[:space:]]*WITH ]] && ! [[ "$u" =~ (^|[^A-Z_])(INSERT|UPDATE|DELETE|MERGE)([^A-Z_]|$) ]]; }; then
+    QUERY="${q} LIMIT ${AUTO_LIMIT}"
+    LIMIT_INJECTED=1
   fi
+  return 0
 }
 
 precheck_pg_container() {
@@ -335,19 +360,26 @@ run_psql_c() {
   else
     fmt=(-t -A)                         # cru: tuples-only unaligned (valor puro, ex. JSON do EXPLAIN)
   fi
+  # Somente leitura: o próprio PostgreSQL recusa escrita (inclusive dentro de função
+  # e de EXPLAIN ANALYZE de UPDATE), sem depender de adivinhar o SQL por regex.
+  local -a ro_env=()
+  [[ $PG_READONLY -eq 1 ]] && ro_env=(-e "PGOPTIONS=-c default_transaction_read_only=on")
   local stderr_file rc=0
   stderr_file="$(mktemp)"
   if [[ -n "$PG_SSH" ]]; then
     local rcmd
-    rcmd="$(shq docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" "${fmt[@]}" -v ON_ERROR_STOP=1 -f -)"
+    rcmd="$(shq docker exec -i "${ro_env[@]}" "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" "${fmt[@]}" -v ON_ERROR_STOP=1 -f -)"
     printf '%s' "$q" | ssh -o LogLevel=ERROR "$PG_SSH" "$rcmd" 2>"$stderr_file" || rc=$?
   else
-    docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" \
+    docker exec "${ro_env[@]}" "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" \
       "${fmt[@]}" -v ON_ERROR_STOP=1 -c "$q" 2>"$stderr_file" || rc=$?
   fi
   if [[ $rc -ne 0 ]]; then
     error "psql falhou (exit $rc)${PG_SSH:+ [remoto: $PG_SSH]}"
     info  "query: $q"
+    if [[ $PG_READONLY -eq 1 ]] && grep -q 'read-only transaction' "$stderr_file"; then
+      info "sessão somente leitura${PG_SSH:+ (padrão no remoto)} — para escrever, repita com --write"
+    fi
     report_block "stderr do psql" < "$stderr_file"
     rm -f "$stderr_file"
     exit "$rc"
@@ -371,17 +403,26 @@ cmd_pg() {
   # Precheck do container só no modo local (no remoto, o erro do docker/ssh aparece na query).
   [[ -z "$PG_SSH" ]] && precheck_pg_container
 
+  # Remoto é somente leitura por padrão: um UPDATE de agente em produção não pode
+  # depender de alguém revisar a query. --write libera; DX_PG_READONLY=1 força no local.
+  PG_READONLY=0
+  if [[ $PG_WRITE -eq 0 ]] && [[ -n "$PG_SSH" || "${DX_PG_READONLY:-0}" == "1" ]]; then PG_READONLY=1; fi
+
   # No remoto, anuncia o alvo antes de rodar. O dx não inspeciona o host: se lá houver
   # container homônimo de OUTRO ambiente, a query roda no lugar errado sem erro nenhum.
   # Esta linha é o que torna esse caso visível — não remova.
-  [[ -n "$PG_SSH" ]] && info "remoto: ${PG_SSH} · ${PG_CONTAINER} · ${PG_DB}"
+  if [[ -n "$PG_SSH" ]]; then
+    info "remoto: ${PG_SSH} · ${PG_CONTAINER} · ${PG_DB} · $([[ $PG_READONLY -eq 1 ]] && echo 'somente leitura' || echo 'ESCRITA LIBERADA')"
+  fi
 
   # Sem args → shell interativo (sem filtros); remoto abre via ssh -t.
   if [[ $# -eq 0 ]]; then
+    local -a ro_env=()
+    [[ $PG_READONLY -eq 1 ]] && ro_env=(-e "PGOPTIONS=-c default_transaction_read_only=on")
     if [[ -n "$PG_SSH" ]]; then
-      exec ssh -t "$PG_SSH" docker exec -it "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB"
+      exec ssh -t "$PG_SSH" "$(shq docker exec -it "${ro_env[@]}" "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB")"
     fi
-    exec docker exec -it "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB"
+    exec docker exec -it "${ro_env[@]}" "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB"
   fi
 
   case "$1" in
@@ -397,11 +438,14 @@ cmd_pg() {
       local term="$1"
       term="${term//\'/\'\'}"                    # escapa aspa simples (SQL-safe)
       [[ "$term" == *%* ]] || term="%${term}%"   # sem curinga explícito → busca parcial
-      run_psql_c "SELECT table_name, column_name, data_type
+      # Todos os schemas do usuário (não só public): tabela em schema próprio
+      # (auditoria, staging…) ficava invisível.
+      run_psql_c "SELECT table_schema, table_name, column_name, data_type
                   FROM information_schema.columns
-                  WHERE table_schema = 'public'
+                  WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+                    AND table_schema NOT LIKE 'pg\_%'
                     AND (column_name ILIKE '$term' OR table_name ILIKE '$term')
-                  ORDER BY table_name, column_name" | maybe_save
+                  ORDER BY table_schema, table_name, column_name" | maybe_save
       ;;
     --explain)
       shift; [[ $# -eq 0 ]] && die "uso: dx pg --explain \"<query>\""
@@ -434,9 +478,15 @@ Index:        \(.Plan."Index Name" // "—")"
       die "flag desconhecida: $1 (use --list-tables, --describe, --explain ou \"<query>\")"
       ;;
     *)
-      local raw_query="$*"
-      local query; query="$(inject_limit_if_missing "$raw_query")"
-      run_psql_c "$query" | maybe_save
+      inject_limit_if_missing "$*"
+      local out
+      out="$(run_psql_c "$QUERY")" || exit $?
+      # Só avisa quando o LIMIT pode ter cortado algo: resultado com exatamente o teto.
+      # Avisar em todo SELECT (até count(*)) era ruído que ninguém lia.
+      if [[ $LIMIT_INJECTED -eq 1 && "${out##*$'\n'}" == "(${AUTO_LIMIT} rows)" ]]; then
+        warn "resultado cortado no auto-LIMIT ${AUTO_LIMIT} — use --full para tudo"
+      fi
+      printf '%s\n' "$out" | maybe_save
       ;;
   esac
 }
@@ -888,26 +938,71 @@ collapse_vendor_frames() {
   '
 }
 
+# Agrupa o log em ENTRADAS (cabeçalho com data + linhas de continuação: mensagem
+# multilinha, stack trace, dump de contexto) e devolve as últimas N — opcionalmente
+# só as [error]. Filtrar por linha (grep) cortava o stack e deixava só o cabeçalho.
+#   $1 = N entradas, $2 = 1 p/ só erros, $3 = "AAAA-MM-DD HH:MM[:SS]" mínimo (opcional)
+last_log_entries() {
+  awk -v n="$1" -v only_err="$2" -v since="${3:-}" '
+    function flush() {
+      if (cur == "") return
+      if ((!only_err || hdr ~ /\[error\]/) && (since == "" || substr(hdr, 1, length(since)) >= since)) {
+        buf[++k] = cur; if (k > n) { delete buf[k-n] }
+      }
+      cur = ""
+    }
+    /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] / {
+      flush(); hdr = $0; cur = $0; next
+    }
+    { cur = (cur == "" ? $0 : cur "\n" $0) }
+    END {
+      flush()
+      for (i = (k > n ? k - n + 1 : 1); i <= k; i++) print buf[i]
+    }
+  '
+}
+
 cmd_logs() {
-  local n=100 only_errors=0 file="$LOG_PATH"
+  local n=20 only_errors=0 file="$LOG_PATH" since=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -n)        n="${2:-}"; [[ "$n" =~ ^[0-9]+$ ]] || die "-n requer um inteiro"; shift 2 ;;
       --errors)  only_errors=1; shift ;;
+      --since)   since="${2:-}"; shift 2 ;;
       --file)    file="${2:-}"; [[ -z "$file" ]] && die "--file requer um caminho"; shift 2 ;;
-      *)         die "flag desconhecida em logs: $1 (use -n N | --errors | --file <path>)" ;;
+      *)         die "flag desconhecida em logs: $1 (use -n N | --errors | --since HH:MM | --file <path>)" ;;
     esac
   done
+  # --since HH:MM[:SS] = hoje; senão "AAAA-MM-DD HH:MM[:SS]". Comparação textual com o
+  # carimbo do cabeçalho, que é ordenável. Serve p/ "algum erro desde que comecei o teste?".
+  if [[ -n "$since" ]]; then
+    if [[ "$since" =~ ^[0-9]{2}:[0-9]{2}(:[0-9]{2})?$ ]]; then since="$(date +%F) $since"
+    elif ! [[ "$since" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}([[:space:]][0-9]{2}:[0-9]{2}(:[0-9]{2})?)?$ ]]; then
+      die "--since espera HH:MM ou 'AAAA-MM-DD HH:MM'"
+    fi
+  fi
 
   # Caminho relativo → resolve a partir da raiz do projeto (o dx é global).
   [[ "$file" != /* ]] && file="$(_dx_project_root)/$file"
   [[ -f "$file" ]] || die "log não encontrado: $file (ajuste DX_LOG_PATH no .env)"
 
-  local -a filter=(cat)
-  [[ $only_errors -eq 1 ]] && filter=(grep -E '\[error\]')
+  # Erro de log é denso: o "in arquivo.php:linha" fica no fim do cabeçalho, que o corte
+  # de 180 chars engolia. Teto de linhas maior porque cada entrada traz o stack.
+  LONG_LINE=600
+  [[ $MAX_LINES_SET -eq 0 ]] && MAX_LINES=400
 
-  info "log: $file (últimas $n linhas)"
-  tail -n "$n" "$file" | "${filter[@]}" | collapse_vendor_frames | maybe_save
+  local kind="entradas"; [[ $only_errors -eq 1 ]] && kind="erros"
+  local desde=""; [[ -n "$since" ]] && desde=" desde $since"
+  local out
+  out="$(last_log_entries "$n" "$only_errors" "$since" < "$file" | collapse_vendor_frames)"
+  if [[ -z "$out" ]]; then
+    # Sem isto o comando saía mudo (e com exit 1 do grep): "sem erro" e "falhou"
+    # ficavam indistinguíveis.
+    info "log: $file — nenhum registro de $kind${desde}"
+    return 0
+  fi
+  info "log: $file (até $n $kind${desde}, mais recentes por último)"
+  printf '%s\n' "$out" | maybe_save
 }
 
 # ────────────────────────────────────────────────────────────────
@@ -921,7 +1016,11 @@ while [[ $# -gt 0 ]]; do
     --save)       SAVE_FILE="${2:-}"; [[ -z "$SAVE_FILE" ]] && die "--save requer um caminho"; shift 2 ;;
     --max-lines)  MAX_LINES="${2:-}"; [[ "$MAX_LINES" =~ ^[0-9]+$ ]] || die "--max-lines requer um inteiro"; MAX_LINES_SET=1; shift 2 ;;
     --host)       PG_SSH="${2:-}"; [[ -z "$PG_SSH" ]] && die "--host requer um host ssh (ex: user@servidor)"; shift 2 ;;
+    --write)      PG_WRITE=1; shift ;;
     -h|--help)    print_help; exit 0 ;;
+    # yii repassa tudo ao console do framework: `dx yii help -h` é ajuda do Yii, não do dx.
+    # Flags globais do dx para o yii vão ANTES do subcomando (dx --save f yii migrate).
+    yii)          if [[ ${#ARGS[@]} -eq 0 ]]; then ARGS+=("$@"); break; fi; ARGS+=("$1"); shift ;;
     *)            ARGS+=("$1"); shift ;;
   esac
 done
